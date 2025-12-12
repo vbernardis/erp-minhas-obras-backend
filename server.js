@@ -1,0 +1,5059 @@
+require('dotenv').config();
+const express = require('express');
+const cors = require('cors');
+const { createClient } = require('@supabase/supabase-js');
+const bcrypt = require('bcrypt');
+const pdfMake = require('pdfmake/build/pdfmake');
+const pdfFonts = require('pdfmake/build/vfs_fonts');
+pdfMake.vfs = pdfFonts;
+const printer = pdfMake;
+const pdf = require('html-pdf');
+const puppeteer = require('puppeteer');
+const fs = require('fs'); // Adicione esta linha
+const path = require('path'); // Adicione esta linha
+const { Buffer } = require('buffer');
+const app = express();
+const PORT = process.env.PORT || 3001;
+const supabaseUrl = process.env.SUPABASE_URL;
+const supabaseServiceKey = process.env.SUPABASE_SERVICE_KEY;
+const supabase = createClient(supabaseUrl, supabaseServiceKey);
+const ExcelJS = require('exceljs'); // ← Adicione esta linha no topo
+const nodemailer = require('nodemailer');
+const axios = require('axios');
+
+
+// Função para converter data no formato DD/MM/YYYY → YYYY-MM-DD
+function converterDataBRParaISO(dataBR) {
+  if (!dataBR) return null;
+  // Remove espaços extras
+  const limpa = dataBR.trim();
+  // Verifica se está no formato dd/mm/yyyy
+  const regex = /^(\d{2})\/(\d{2})\/(\d{4})$/;
+  const match = limpa.match(regex);
+  if (match) {
+    const [, dia, mes, ano] = match;
+    return `${ano}-${mes}-${dia}`;
+  }
+  // Se já estiver em ISO ou for inválido, retorna como está (ou null)
+  return limpa || null;
+}
+
+if (!supabaseUrl || !supabaseServiceKey) {
+  console.error('❌ ERRO: SUPABASE_URL ou SUPABASE_SERVICE_KEY não definidos no .env');
+  process.exit(1);
+}
+
+// Função para carregar as configurações da empresa (com cache)
+let cacheConfiguracao = null;
+let cacheExpiry = 0;
+
+const carregarConfiguracaoEmpresa = async () => {
+  const agora = Date.now();
+  if (cacheConfiguracao && agora < cacheExpiry) {
+    return cacheConfiguracao; // Retorna do cache
+  }
+
+  try {
+    const { data, error } = await supabase
+      .from('configuracoes_empresa')
+      .select('nome_empresa, logo_url')
+      .eq('id', 1)
+      .single();
+
+    if (error) throw error;
+    cacheConfiguracao = data;
+    cacheExpiry = agora + 300000; // Cache de 5 minutos
+    return data;
+  } catch (error) {
+    console.error('Erro ao carregar configuração da empresa:', error);
+    return { nome_empresa: 'ERP Minhas Obras', logo_url: null };
+  }
+};
+
+app.use(cors({ origin: '*' }));
+app.use(express.json());
+
+const multer = require('multer');
+const upload = multer({ storage: multer.memoryStorage() });
+
+// Log de todas as requisições recebidas pelo backend
+app.use((req, res, next) => {
+  console.log(`📨 [BACKEND] Recebida requisição: ${req.method} ${req.url}`);
+  console.log(`   Headers:`, Object.keys(req.headers).join(', '));
+  next();
+});
+
+// Log global de todas as requisições
+app.use((req, res, next) => {
+  console.log(`📨 ${req.method} ${req.url}`);
+  console.log(`📥 Body:`, req.body);
+  next();
+});
+
+// === INÍCIO: Middleware de Autorização por Tela e Obra ===
+// Função para extrair o userId do header X-User-ID
+const getUserFromRequest = (req) => {
+  const userId = req.headers['x-user-id']; // Lê o header X-User-ID
+  if (!userId) return null;
+  const num = parseInt(userId, 10);
+  return isNaN(num) ? null : num;
+};
+
+// Middleware de autorização por tela e obra (VERSÃO ATUALIZADA)
+const requirePermission = (telaRequerida, verificarObra = false) => {
+  return async (req, res, next) => {
+    const userId = getUserFromRequest(req);
+    if (!userId) {
+      return res.status(401).json({ error: 'Usuário não autenticado' });
+    }
+
+    try {
+      // 1. Buscar usuário completo
+      const { data: usuario, error: userError } = await supabase
+        .from('usuarios')
+        .select('role, permissions')
+        .eq('id', userId)
+        .single();
+
+      if (userError || !usuario) {
+        return res.status(404).json({ error: 'Usuário não encontrado' });
+      }
+
+      // 2. Bypass total para role 'master'
+      if (usuario.role === 'master') {
+        return next();
+      }
+
+      // 3. Parsear permissões (pode ser string JSON ou array)
+      let permissoes = [];
+      try {
+        permissoes = typeof usuario.permissions === 'string' 
+          ? JSON.parse(usuario.permissions)
+          : usuario.permissions;
+      } catch (e) {
+        permissoes = [];
+      }
+
+      // 4. Verificar permissão
+      const temPermissao = permissoes.includes('*') || permissoes.includes(telaRequerida);
+      if (!temPermissao) {
+        return res.status(403).json({ error: 'Acesso negado: permissão insuficiente para esta tela' });
+      }
+
+      // 5. Verificar acesso à obra (se necessário)
+      if (verificarObra) {
+        let obraId;
+        if (req.params?.id && (req.url.includes('/obras/') || req.url.includes('/diarios-obras/') || req.url.includes('/notas-fiscais/')  || req.url.includes('/relatorios/obra/'))) {
+          obraId = parseInt(req.params.id, 10);
+        } 
+        else if (req.query?.obra_id) {
+          obraId = parseInt(req.query.obra_id, 10);
+        } else if (req.body?.obra_id) {
+          obraId = parseInt(req.body.obra_id, 10);
+        }
+        if (!obraId) {
+          return res.status(400).json({ error: 'Obra não especificada' });
+        }
+
+        // Bypass para admin/master ou se não usar acesso_obras_usuario
+        if (usuario.role === 'admin' || usuario.role === 'master') {
+          return next();
+        }
+
+        // (Opcional) Verificar na tabela acesso_obras_usuario apenas para usuários comuns
+        const {  acessoObra, error: obraError } = await supabase
+          .from('acesso_obras_usuario')
+          .select('obra_id')
+          .eq('usuario_id', userId)
+          .eq('obra_id', obraId);
+        if (obraError || !acessoObra.length) {
+          return res.status(403).json({ error: 'Acesso negado: esta obra não está autorizada para você' });
+        }
+      }
+
+      next();
+    } catch (error) {
+      console.error('Erro no middleware de permissão:', error);
+      res.status(500).json({ error: 'Erro interno de autorização' });
+    }
+  };
+};
+// === FIM: Middleware de Autorização ===
+
+// Rota de saúde
+app.get('/health', (req, res) => {
+  res.json({ status: 'OK', message: 'Backend operacional' });
+});
+
+// Rota raiz
+app.get('/', (req, res) => {
+  res.json({
+    message: '✅ Backend conectado ao Supabase',
+    rotas: [
+      'GET /health',
+      'GET /obras',
+      'GET /users',
+      'GET /diarios-obras'
+    ]
+  });
+});
+
+// ========================
+// ========================
+// ROTAS DE OBRAS
+// ========================
+app.get('/obras', async (req, res) => { // ← SEM PROTEÇÃO
+  try {
+    console.log('🔍 Buscando obras no Supabase...');
+    const { data, error } = await supabase
+      .from('obras')
+      .select('*');
+    if (error) {
+      console.error('❌ Erro do Supabase ao buscar obras:', error);
+      return res.status(500).json({ error: 'Erro ao buscar obras' });
+    }
+    console.log('✅ Obras encontradas:', data.length);
+    res.json(data || []);
+  } catch (error) {
+    console.error('❌ Erro interno ao buscar obras:', error.message);
+    res.status(500).json({ error: 'Erro interno ao buscar obras' });
+  }
+});
+
+// GET /obras/:id (exige permissão + acesso à obra específica)
+app.get('/obras/:id', requirePermission('obras.visualizar', true), async (req, res) => {
+  const { id } = req.params;
+  const obraId = parseInt(id, 10);
+  if (isNaN(obraId)) {
+    return res.status(400).json({ error: 'ID da obra inválido' });
+  }
+  try {
+    const { data, error } = await supabase
+      .from('obras')
+      .select('*')
+      .eq('id', obraId)
+      .single();
+    if (error) {
+      console.error('Erro ao buscar obra:', error);
+      return res.status(404).json({ error: 'Obra não encontrada' });
+    }
+    res.json(data);
+  } catch (error) {
+    console.error('Erro interno ao buscar obra:', error.message);
+    res.status(500).json({ error: 'Erro interno' });
+  }
+});
+
+// POST /obras — Criar nova obra
+app.post('/obras', async (req, res) => {
+  try {
+    const {
+      nome,
+      endereco,
+      "A R T": art,
+      cno,
+      eng_responsavel,
+      proprietario,
+      data_inicio,
+      previsao_termino,
+      valor_previsto = 0,
+      valor_realizado = 0
+    } = req.body;
+
+    // Validação mínima
+    if (!nome || !endereco || !eng_responsavel || !proprietario) {
+      console.warn('⚠️ Campos obrigatórios ausentes na criação de obra');
+      return res.status(400).json({ error: 'Campos obrigatórios ausentes: nome, endereco, eng_responsavel, proprietario' });
+    }
+
+    console.log('📥 Recebido payload para nova obra:', { nome, endereco, art, cno, eng_responsavel, proprietario, data_inicio, previsao_termino });
+
+    const { data, error } = await supabase
+      .from('obras')
+      .insert([
+        {
+          nome,
+          endereco,
+          "A R T": art || null,
+          cno: cno || null,
+          eng_responsavel,
+          proprietario,
+          data_inicio: data_inicio || null,
+          previsao_termino: previsao_termino || null,
+          valor_previsto: parseFloat(valor_previsto) || 0,
+          valor_realizado: parseFloat(valor_realizado) || 0,
+         }
+      ])
+      .select();
+
+    if (error) {
+      console.error('❌ Erro do Supabase ao criar obra:', error);
+      return res.status(500).json({ error: 'Erro ao criar obra no banco de dados' });
+    }
+
+    console.log('✅ Obra criada com sucesso:', data[0]);
+    res.status(201).json(data[0]);
+  } catch (error) {
+    console.error('❌ Erro interno ao criar obra:', error.message);
+    res.status(500).json({ error: 'Erro interno ao criar obra' });
+  }
+});
+
+// PUT /obras/:id — Atualizar obra existente
+app.put('/obras/:id', async (req, res) => {
+  const { id } = req.params;
+  const obraId = parseInt(id, 10);
+
+  if (isNaN(obraId)) {
+    return res.status(400).json({ error: 'ID da obra inválido' });
+  }
+
+  try {
+    const {
+      nome,
+      endereco,
+      "A R T": art,
+      cno,
+      eng_responsavel,
+      proprietario,
+      data_inicio,
+      previsao_termino,
+      evolucao_fisica // ✅ Permitir atualização da evolução física
+    } = req.body;
+
+    if (!nome || !endereco || !eng_responsavel || !proprietario) {
+      console.warn('⚠️ Campos obrigatórios ausentes na atualização de obra');
+      return res.status(400).json({ error: 'Campos obrigatórios ausentes: nome, endereco, eng_responsavel, proprietario' });
+    }
+
+    console.log(`🔄 Atualizando obra ID ${obraId}:`, { nome, endereco, art, cno, eng_responsavel, proprietario, data_inicio, previsao_termino, evolucao_fisica });
+
+    const updateData = {
+      nome,
+      endereco,
+      "A R T": art || null,
+      cno: cno || null,
+      eng_responsavel,
+      proprietario,
+      data_inicio: data_inicio || null,
+      previsao_termino: previsao_termino || null
+    };
+
+    // Só atualiza evolucao_fisica se for fornecida
+    if (evolucao_fisica !== undefined) {
+      updateData.evolucao_fisica = parseFloat(evolucao_fisica) || 0.00;
+    }
+
+    const { data, error } = await supabase
+      .from('obras')
+      .update(updateData)
+      .eq('id', obraId)
+      .select();
+
+    if (error) {
+      console.error('❌ Erro do Supabase ao atualizar obra:', error);
+      return res.status(500).json({ error: 'Erro ao atualizar obra' });
+    }
+
+    if (!data || data.length === 0) {
+      console.warn(`⚠️ Obra com ID ${obraId} não encontrada para atualização`);
+      return res.status(404).json({ error: 'Obra não encontrada' });
+    }
+
+    console.log('✅ Obra atualizada com sucesso:', data[0]);
+    res.json(data[0]);
+  } catch (error) {
+    console.error('❌ Erro interno ao atualizar obra:', error.message);
+    res.status(500).json({ error: 'Erro interno ao atualizar obra' });
+  }
+});
+
+// DELETE /obras/:id — Deletar obra
+app.delete('/obras/:id', async (req, res) => {
+  const { id } = req.params;
+  const obraId = parseInt(id, 10);
+
+  if (isNaN(obraId)) {
+    return res.status(400).json({ error: 'ID da obra inválido' });
+  }
+
+  try {
+    console.log(`🗑️ Tentando deletar obra ID ${obraId}`);
+
+    const { error } = await supabase
+      .from('obras')
+      .delete()
+      .eq('id', obraId);
+
+    if (error) {
+      console.error('❌ Erro do Supabase ao deletar obra:', error);
+      return res.status(500).json({ error: 'Erro ao deletar obra' });
+    }
+
+    console.log(`✅ Obra ID ${obraId} deletada com sucesso`);
+    res.status(204).send();
+  } catch (error) {
+    console.error('❌ Erro interno ao deletar obra:', error.message);
+    res.status(500).json({ error: 'Erro interno ao deletar obra' });
+  }
+});
+
+// ========================
+// ROTAS DE DIÁRIOS DE OBRA — COMPLETAS (com PDF)
+// ========================
+
+// Helper: buscar obra pelo ID
+const buscarObra = async (obra_id) => {
+  const { data, error } = await supabase
+    .from('obras')
+    .select('nome')
+    .eq('id', obra_id)
+    .single();
+  return error ? null : data;
+};
+
+// GET /diarios-obras (com filtros)
+app.get('/diarios-obras', async (req, res) => {
+  try {
+    let query = supabase
+      .from('diarios_obras')
+      .select(`
+        *,
+        obras (nome)
+      `);
+
+    if (req.query.obra_id) query = query.eq('obra_id', req.query.obra_id);
+    if (req.query.status) query = query.eq('status', req.query.status);
+    query = query.order('created_at', { ascending: false });
+
+    const { data, error } = await query;
+
+    if (error) {
+      console.error('❌ Erro do Supabase ao buscar diários:', error);
+      return res.status(500).json({ error: 'Erro ao buscar diários' });
+    }
+
+    res.json(data || []);
+  } catch (error) {
+    console.error('❌ Erro interno ao buscar diários:', error.message);
+    res.status(500).json({ error: 'Erro interno ao buscar diários' });
+  }
+});
+
+// GET /diarios-obras/:id
+app.get('/diarios-obras/:id', async (req, res) => {
+  const { id } = req.params;
+  const diarioId = parseInt(id, 10);
+
+  if (isNaN(diarioId)) {
+    return res.status(400).json({ error: 'ID inválido' });
+  }
+
+  try {
+    const { data, error } = await supabase
+      .from('diarios_obras')
+      .select('*')
+      .eq('id', diarioId)
+      .single();
+
+    if (error) {
+      console.error('Supabase error:', error);
+      return res.status(404).json({ error: 'Diário não encontrado' });
+    }
+
+    const safeDiario = {
+      ...data,
+      atividades: Array.isArray(data.atividades) ? data.atividades : [],
+      efetivos: Array.isArray(data.efetivos) ? data.efetivos : [],
+      imagens: Array.isArray(data.imagens) ? data.imagens : [],
+      turnos: data.turnos && typeof data.turnos === 'object' ? data.turnos : { manha: '', tarde: '', noite: '' }
+    };
+
+    res.json(safeDiario);
+  } catch (error) {
+    console.error('Erro interno:', error.message);
+    res.status(500).json({ error: 'Erro ao carregar diário' });
+  }
+});
+
+// PDF: GET /mapa-chuvas/pdf?obra_id=5&mes=2025-04
+app.get('/mapa-chuvas/pdf', async (req, res) => {
+  const { obra_id, mes } = req.query; // mes: "2025-04"
+
+  if (!obra_id || !mes || !/^\d{4}-\d{2}$/.test(mes)) {
+    return res.status(400).json({ error: 'obra_id e mes (YYYY-MM) são obrigatórios' });
+  }
+
+  const obraId = parseInt(obra_id, 10);
+  const ano = parseInt(mes.split('-')[0], 10);
+  const mesNum = parseInt(mes.split('-')[1], 10) - 1; // JS: jan = 0
+  const totalDiasMes = new Date(ano, mesNum + 1, 0).getDate();
+
+  let browser;
+  try {
+    // Buscar obra
+    const { data: obra, error: obraError } = await supabase
+      .from('obras')
+      .select('nome')
+      .eq('id', obraId)
+      .single();
+
+    if (obraError || !obra) {
+      return res.status(404).json({ error: 'Obra não encontrada' });
+    }
+
+    // Buscar TODOS os diários da obra no mês e coletar dias improdutivos
+    const { data: diarios, error: diariosError } = await supabase
+      .from('diarios_obras')
+      .select('dias_improdutivos, data')
+      .eq('obra_id', obraId)
+      .gte('data', `${mes}-01`)
+      .lte('data', `${mes}-${totalDiasMes.toString().padStart(2, '0')}`);
+
+    if (diariosError) throw diariosError;
+
+    // Unificar todos os dias improdutivos do mês (em caso de múltiplos diários)
+    const todosDiasImprodutivos = new Set();
+    diarios.forEach(d => {
+      if (Array.isArray(d.dias_improdutivos)) {
+        d.dias_improdutivos.forEach(dia => {
+          if (typeof dia === 'number' && dia >= 1 && dia <= totalDiasMes) {
+            todosDiasImprodutivos.add(dia);
+          }
+        });
+      }
+    });
+
+    const diasArray = Array.from(todosDiasImprodutivos).sort((a, b) => a - b);
+    // Função para gerar SVG do Mapa de Chuvas Circular
+const gerarSvgCircular = (diasImprodutivos, totalDias) => {
+  const r = 160; // raio
+  const cx = 170;
+  const cy = 170;
+  const anguloTotal = 360;
+  const anguloPorDia = anguloTotal / totalDias;
+  const setores = [];
+
+  for (let i = 0; i < totalDias; i++) {
+    const dia = i + 1;
+    const startAngle = (i * anguloPorDia - 90) * (Math.PI / 180);
+    const endAngle = ((i + 1) * anguloPorDia - 90) * (Math.PI / 180);
+
+    const x1 = cx + r * Math.cos(startAngle);
+    const y1 = cy + r * Math.sin(startAngle);
+    const x2 = cx + r * Math.cos(endAngle);
+    const y2 = cy + r * Math.sin(endAngle);
+
+    const cor = diasImprodutivos.has(dia) ? '#3b82f6' : '#f9fafb'; // azul ou branco
+    const textoCor = diasImprodutivos.has(dia) ? 'white' : 'black';
+    const largeArcFlag = anguloPorDia > 180 ? 1 : 0;
+
+    const pathData = [
+      `M ${cx} ${cy}`,
+      `L ${x1} ${y1}`,
+      `A ${r} ${r} 0 ${largeArcFlag} 1 ${x2} ${y2}`,
+      'Z'
+    ].join(' ');
+
+    const textX = cx + (r - 25) * Math.cos((startAngle + endAngle) / 2);
+    const textY = cy + (r - 25) * Math.sin((startAngle + endAngle) / 2);
+
+    setores.push(`
+      <path d="${pathData}" fill="${cor}" stroke="#e5e7eb" stroke-width="1"/>
+      <text x="${textX}" y="${textY}" text-anchor="middle" dominant-baseline="middle" font-size="10" font-weight="bold" fill="${textoCor}">${dia}</text>
+    `);
+  }
+
+  return `
+    <svg width="340" height="340" viewBox="0 0 340 340" style="margin: 20px auto;">
+      ${setores.join('')}
+    </svg>
+  `;
+};
+
+// Gerar o SVG
+const svgCircular = gerarSvgCircular(todosDiasImprodutivos, totalDiasMes);
+    const diasUteis = totalDiasMes - diasArray.length;
+
+    // Formatar mês/ano em português
+    const mesNome = new Date(ano, mesNum).toLocaleDateString('pt-BR', { month: 'long', year: 'numeric' });
+
+    // Gerar HTML
+    const html = `
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <meta charset="utf-8">
+        <title>Mapa de Chuvas - ${obra.nome} - ${mes}</title>
+        <style>
+          body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; font-size: 11pt; margin: 0; padding: 20mm; color: #333; }
+          .header { text-align: center; margin-bottom: 25px; border-bottom: 2px solid #1e40af; padding-bottom: 15px; }
+          .header h1 { font-size: 18pt; color: #1e3a8a; margin: 0; }
+          .content { max-width: 800px; margin: 0 auto; }
+          .info { background: #f8fafc; border: 1px solid #cbd5e1; border-radius: 8px; padding: 15px; margin: 20px 0; }
+          .info p { margin: 6px 0; }
+          .dias { margin-top: 20px; }
+          .dias-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(40px, 1fr));
+            gap: 8px;
+            margin-top: 10px;
+          }
+          .dia-item {
+            text-align: center;
+            padding: 8px 4px;
+            background: #dbeafe;
+            border-radius: 4px;
+            font-weight: bold;
+            color: #1e40af;
+          }
+          .footer { text-align: center; margin-top: 30px; color: #64748b; font-size: 10pt; }
+        </style>
+      </head>
+      <body>
+        <div class="content">
+          <div class="header">
+            <h1>MAPA DE CHUVAS</h1>
+            <p>${obra.nome} • ${mesNome}</p>
+          </div>
+
+          <div class="info">
+            <p><strong>Período:</strong> ${mesNome}</p>
+            <p><strong>Dias improdutivos (chuvosos):</strong> ${diasArray.length > 0 ? diasArray.join(', ') : 'Nenhum'}</p>
+            <p><strong>Total de dias úteis:</strong> ${diasUteis} / ${totalDiasMes}</p>
+          </div>
+
+          <div class="dias">
+            <p><strong>Dias marcados como improdutivos:</strong></p>
+            ${diasArray.length > 0
+              ? `<div class="dias-grid">${diasArray.map(d => `<div class="dia-item">${d.toString().padStart(2, '0')}</div>`).join('')}</div>`
+              : '<p>Nenhum dia registrado.</p>'
+            }
+          </div>
+
+          <!-- GRÁFICO CIRCULAR -->
+          <div style="text-align: center; margin-top: 20px;">
+            <h3 style="font-size: 12pt; color: #1e3a8a; margin-bottom: 10px;">Visualização do Mapa de Chuvas</h3>
+            ${svgCircular}
+          </div>
+
+          <div class="footer">
+            Relatório gerado automaticamente pelo ERP Minhas Obras
+          </div>
+        </div>
+      </body>
+      </html>
+    `;
+
+    // Gerar PDF
+    browser = await puppeteer.launch({ headless: true });
+    const page = await browser.newPage();
+    await page.setContent(html, { waitUntil: 'domcontentloaded', timeout: 0 });
+    const pdfBuffer = await page.pdf({ format: 'A4', printBackground: true });
+    await browser.close();
+
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `inline; filename=mapa-chuvas-${obraId}-${mes}.pdf`);
+    res.end(pdfBuffer);
+
+  } catch (error) {
+    console.error('Erro ao gerar PDF do Mapa de Chuvas:', error);
+    if (browser) await browser.close().catch(() => {});
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'Erro ao gerar PDF' });
+    }
+  }
+});
+
+// POST /diarios-obras
+app.post('/diarios-obras', async (req, res) => {
+  try {
+    const {
+      obra_id,
+      data,
+      turno_manha,
+      turno_tarde,
+      turno_noite,
+      atividades,
+      equipes,
+      observacoes,
+      imagens,
+      status,
+      dias_improdutivos = []
+    } = req.body;
+
+    if (!obra_id || !data) {
+      return res.status(400).json({ error: 'obra_id e data são obrigatórios' });
+    }
+
+    const { elaborado_por } = req.body; // ✅ Pegar do frontend
+
+    const payload = {
+      obra_id: parseInt(obra_id),
+      data,
+      clima: '',
+      equipe: '',
+      atividades: Array.isArray(atividades) ? atividades.filter(a => a?.trim()) : [],
+      observacoes: observacoes || '',
+      turnos: {
+        manha: turno_manha || '',
+        tarde: turno_tarde || '',
+        noite: turno_noite || ''
+      },
+      efetivos: Array.isArray(equipes) ? equipes.filter(e => e?.trim()) : [],
+      imagens: Array.isArray(imagens) ? imagens : [],
+      status: status || 'Revisar',
+      dias_improdutivos: Array.isArray(dias_improdutivos) ? dias_improdutivos : [],
+      elaborado_por: elaborado_por || null
+    };
+
+    const { data: novaObra, error } = await supabase
+      .from('diarios_obras')
+      .insert([payload])
+      .select();
+
+    if (error) {
+      console.error('❌ Erro ao criar diário:', error);
+      return res.status(500).json({ error: 'Erro ao salvar diário' });
+    }
+
+    res.status(201).json(novaObra[0]);
+  } catch (error) {
+    console.error('❌ Erro interno ao criar diário:', error.message);
+    res.status(500).json({ error: 'Erro interno' });
+  }
+});
+
+// PUT /diarios-obras/:id
+app.put('/diarios-obras/:id', async (req, res) => {
+  const { id } = req.params;
+  const diarioId = parseInt(id, 10);
+
+  if (isNaN(diarioId)) {
+    return res.status(400).json({ error: 'ID inválido' });
+  }
+
+  try {
+    const {
+      obra_id,
+      data,
+      turno_manha,
+      turno_tarde,
+      turno_noite,
+      atividades,
+      equipes,
+      observacoes,
+      imagens,
+      status
+    } = req.body;
+
+    const { elaborado_por } = req.body; // ✅ Pegar do frontend 
+
+    const payload = {
+      obra_id: parseInt(obra_id),
+      data,
+      atividades: Array.isArray(atividades) ? atividades.filter(a => a?.trim()) : [],
+      observacoes: observacoes || '',
+      turnos: {
+        manha: turno_manha || '',
+        tarde: turno_tarde || '',
+        noite: turno_noite || ''
+      },
+      efetivos: Array.isArray(equipes) ? equipes.filter(e => e?.trim()) : [],
+      imagens: Array.isArray(imagens) ? imagens : [],
+      status: status || 'Revisar',
+      elaborado_por: elaborado_por || null // ✅ Adicionar esta linha
+    };
+
+    const { data: atualizado, error } = await supabase
+      .from('diarios_obras')
+      .update(payload)
+      .eq('id', diarioId)
+      .select();
+
+    if (error) {
+      console.error('❌ Erro ao atualizar diário:', error);
+      return res.status(500).json({ error: 'Erro ao atualizar diário' });
+    }
+
+    if (!atualizado || atualizado.length === 0) {
+      return res.status(404).json({ error: 'Diário não encontrado' });
+    }
+
+    res.json(atualizado[0]);
+  } catch (error) {
+    console.error('❌ Erro interno ao atualizar diário:', error.message);
+    res.status(500).json({ error: 'Erro interno' });
+  }
+});
+
+// DELETE /diarios-obras/:id
+app.delete('/diarios-obras/:id', async (req, res) => {
+  const { id } = req.params;
+  const diarioId = parseInt(id, 10);
+
+  if (isNaN(diarioId)) {
+    return res.status(400).json({ error: 'ID inválido' });
+  }
+
+  try {
+    // 1. Buscar o diário para obter as URLs das imagens
+    const { data: diario, error: selectError } = await supabase
+      .from('diarios_obras')
+      .select('imagens, documentos')
+      .eq('id', diarioId)
+      .single();
+
+    if (selectError && selectError.code === 'PGRST116') {
+      return res.status(404).json({ error: 'Diário de obra não encontrado.' });
+    }
+    if (selectError) {
+      console.error('Erro ao buscar diário:', selectError);
+      return res.status(500).json({ error: 'Erro ao buscar diário.' });
+    }
+    if (!diario) {
+      return res.status(404).json({ error: 'Diário de obra não encontrado.' });
+    }
+
+    // 2. Função SIMPLES para extrair o caminho do arquivo da URL pública
+    const extrairCaminhoDaUrl = (url) => {
+      if (!url) return null;
+      // Regex para extrair tudo após '/object/public/'
+      const match = url.match(/\/object\/public\/(.+)$/);
+      return match ? match[1] : null;
+    };
+
+    // 3. Coletar todos os caminhos para exclusão
+    const arquivosParaExcluir = [];
+
+    if (Array.isArray(diario.imagens)) {
+      diario.imagens.forEach(url => {
+        const caminho = extrairCaminhoDaUrl(url);
+        if (caminho) arquivosParaExcluir.push(caminho);
+      });
+    }
+    if (Array.isArray(diario.documentos)) {
+      diario.documentos.forEach(url => {
+        const caminho = extrairCaminhoDaUrl(url);
+        if (caminho) arquivosParaExcluir.push(caminho);
+      });
+    }
+
+    // 4. Excluir os arquivos do Storage (usando o cliente com SERVICE_KEY)
+    if (arquivosParaExcluir.length > 0) {
+      console.log(`[DELETE] Excluindo arquivos:`, arquivosParaExcluir);
+      const { error: storageError } = await supabase
+        .storage
+        .from('diario-obras') // Nome do seu bucket
+        .remove(arquivosParaExcluir);
+
+      if (storageError) {
+        console.error('[DELETE] Erro ao excluir arquivos do Storage:', storageError);
+        // Não impede a exclusão do banco — apenas loga
+      } else {
+        console.log(`[DELETE] ${arquivosParaExcluir.length} arquivos excluídos com sucesso.`);
+      }
+    }
+
+    // 5. Excluir o registro do banco de dados
+    const { error: deleteError } = await supabase
+      .from('diarios_obras')
+      .delete()
+      .eq('id', diarioId);
+
+    if (deleteError) {
+      console.error('[DELETE] Erro ao excluir diário do banco:', deleteError);
+      return res.status(500).json({ error: 'Erro ao excluir diário.' });
+    }
+
+    res.status(204).send(); // Sucesso
+
+  } catch (error) {
+    console.error('[DELETE] Erro interno:', error.message);
+    res.status(500).json({ error: 'Erro interno ao excluir diário.' });
+  }
+});
+
+// Configurar Nodemailer (opcional)
+let transporter = null;
+if (process.env.SMTP_HOST) {
+  transporter = nodemailer.createTransport({
+    host: process.env.SMTP_HOST,
+    port: parseInt(process.env.SMTP_PORT) || 587,
+    secure: false,
+    auth: {
+      user: process.env.SMTP_USER,
+      pass: process.env.SMTP_PASS
+    }
+  });
+}
+
+// Função para gerar token único
+const crypto = require('crypto');
+const generateToken = () => crypto.randomBytes(32).toString('hex');
+
+// ========================
+// ROTAS DE USUÁRIOS — CRUD COMPLETO
+// ========================
+
+// Função auxiliar para normalizar permissions
+const normalizePermissions = (perms) => {
+  if (Array.isArray(perms)) return perms;
+  if (typeof perms === 'string') {
+    try {
+      return JSON.parse(perms);
+    } catch (e) {
+      console.warn('Permissions inválidas:', perms);
+    }
+  }
+  return ['obras:read'];
+};
+
+// GET /users
+app.get('/users', async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('usuarios')
+      .select('*');
+
+    if (error) {
+      console.error('Erro ao buscar usuários:', error);
+      return res.status(500).json({ error: 'Erro ao buscar usuários' });
+    }
+
+    const usuariosSemSenha = data.map(user => {
+      const { password, ...usuario } = user;
+      return {
+        ...usuario,
+        permissions: normalizePermissions(usuario.permissions)
+      };
+    });
+
+    res.json(usuariosSemSenha);
+  } catch (error) {
+    console.error('Erro interno ao buscar usuários:', error);
+    res.status(500).json({ error: 'Erro interno' });
+  }
+});
+
+// PUT /users/change-password — Corrigido e com logs visíveis
+app.put('/users/change-password', async (req, res) => {
+  console.log('✅ ROTA DE TROCA DE SENHA EXECUTADA!');
+  console.log('📥 Dados recebidos:', req.body);
+
+  try {
+    const { userId, currentPassword, newPassword } = req.body;
+
+    if (!userId || !currentPassword || !newPassword) {
+      console.log('❌ Dados ausentes');
+      return res.status(400).json({ error: 'ID do usuário, senha atual e nova senha são obrigatórios' });
+    }
+
+    let userIdNum;
+    if (typeof userId === 'number') {
+      userIdNum = userId;
+    } else if (typeof userId === 'string') {
+      userIdNum = Number(userId);
+    } else {
+      console.log('❌ Tipo de userId inválido:', typeof userId);
+      return res.status(400).json({ error: 'ID de usuário inválido: tipo não suportado' });
+    }
+
+    if (!Number.isInteger(userIdNum) || userIdNum <= 0) {
+      console.log('❌ ID não é inteiro positivo:', userIdNum);
+      return res.status(400).json({ error: 'ID de usuário inválido' });
+    }
+
+    console.log('🔍 Buscando usuário com ID:', userIdNum);
+    const { data: user, error } = await supabase
+      .from('usuarios')
+      .select('password')
+      .eq('id', userIdNum)
+      .single();
+
+    if (error || !user) {
+      console.log('❌ Usuário não encontrado');
+      return res.status(404).json({ error: 'Usuário não encontrado' });
+    }
+
+    const isMatch = await bcrypt.compare(currentPassword, user.password);
+    if (!isMatch) {
+      console.log('❌ Senha atual incorreta');
+      return res.status(401).json({ error: 'Senha atual incorreta' });
+    }
+
+    const hashedPassword = await bcrypt.hash(newPassword, 10);
+    const { error: updateError } = await supabase
+      .from('usuarios')
+      .update({ password: hashedPassword })
+      .eq('id', userIdNum);
+
+    if (updateError) {
+      console.log('❌ Erro ao atualizar senha no Supabase:', updateError);
+      return res.status(500).json({ error: 'Erro ao atualizar senha' });
+    }
+
+    console.log('✅ Senha atualizada com sucesso para usuário ID:', userIdNum);
+    res.json({ message: 'Senha atualizada com sucesso' });
+  } catch (error) {
+    console.error('💥 Erro interno na troca de senha:', error);
+    res.status(500).json({ error: 'Erro interno' });
+  }
+});
+
+// GET /users/:id
+app.get('/users/:id', async (req, res) => {
+  const { id } = req.params;
+  const userId = parseInt(id, 10);
+
+  if (isNaN(userId)) {
+    return res.status(400).json({ error: 'ID inválido' });
+  }
+
+  try {
+    const { data, error } = await supabase
+      .from('usuarios')
+      .select('*')
+      .eq('id', userId)
+      .single();
+
+    if (error) {
+      return res.status(404).json({ error: 'Usuário não encontrado' });
+    }
+
+    const { password, ...usuarioSemSenha } = data;
+    res.json({
+      ...usuarioSemSenha,
+      permissions: normalizePermissions(usuarioSemSenha.permissions)
+    });
+  } catch (error) {
+    console.error('Erro ao buscar usuário:', error);
+    res.status(500).json({ error: 'Erro interno' });
+  }
+});
+
+// ✅ NOVA: POST /users
+app.post('/users', async (req, res) => {
+  const { name, email, password, role, permissions = ['obras:read'] } = req.body;
+
+  if (!name || !email || !password) {
+    return res.status(400).json({ error: 'Nome, e-mail e senha são obrigatórios' });
+  }
+
+  try {
+    // Verificar se e-mail já existe
+    const {  existing, error: checkError } = await supabase
+      .from('usuarios')
+      .select('id')
+      .eq('email', email)
+      .single();
+
+    if (!checkError && existing) {
+      return res.status(400).json({ error: 'E-mail já cadastrado' });
+    }
+
+    const hashedPassword = await bcrypt.hash(password, 10);
+
+    const { data, error } = await supabase
+      .from('usuarios')
+      .insert([{
+        name,
+        email,
+        password: hashedPassword,
+        role: role || 'user',
+        permissions: Array.isArray(permissions) ? permissions : ['obras:read']
+      }])
+      .select();
+
+    if (error) {
+      console.error('Erro ao criar usuário:', error);
+      return res.status(500).json({ error: 'Erro ao criar usuário' });
+    }
+
+    const { password: _, ...usuarioSemSenha } = data[0];
+    res.status(201).json(usuarioSemSenha);
+  } catch (error) {
+    console.error('Erro interno ao criar usuário:', error);
+    res.status(500).json({ error: 'Erro interno' });
+  }
+});
+
+// ========================
+// ROTAS DE PERMISSÕES E ACESSO POR OBRA
+// ========================
+
+// GET /users/:id/permissoes — Buscar permissões do usuário
+app.get('/users/:id/permissoes', async (req, res) => {
+  const { id } = req.params;
+  const userId = parseInt(id, 10);
+  if (isNaN(userId)) {
+    return res.status(400).json({ error: 'ID de usuário inválido' });
+  }
+  try {
+    const { data, error } = await supabase
+      .from('permissoes_usuario')
+      .select('tela, acao')
+      .eq('usuario_id', userId);
+    if (error) {
+      console.error('Erro ao buscar permissões:', error);
+      return res.status(500).json({ error: 'Erro ao buscar permissões' });
+    }
+    res.json(data || []);
+  } catch (error) {
+    console.error('Erro interno ao buscar permissões:', error);
+    res.status(500).json({ error: 'Erro interno' });
+  }
+});
+
+// GET /users/:id/obras — Buscar obras autorizadas para o usuário (IDs como strings)
+app.get('/users/:id/obras', async (req, res) => {
+  const { id } = req.params;
+  const userId = parseInt(id, 10);
+  if (isNaN(userId)) {
+    return res.status(400).json({ error: 'ID de usuário inválido' });
+  }
+  try {
+    const { data, error } = await supabase
+      .from('acesso_obras_usuario')
+      .select('obra_id')
+      .eq('usuario_id', userId);
+    if (error) {
+      console.error('Erro ao buscar obras autorizadas:', error);
+      return res.status(500).json({ error: 'Erro ao buscar obras autorizadas' });
+    }
+    // ✅ Converter obra_id para string aqui no backend
+    const obrasAsString = data.map(item => ({ obra_id: item.obra_id.toString() }));
+    res.json(obrasAsString);
+  } catch (error) {
+    console.error('Erro interno ao buscar obras autorizadas:', error);
+    res.status(500).json({ error: 'Erro interno' });
+  }
+});
+
+// POST /users/:id/permissoes — Salvar permissões do usuário
+app.post('/users/:id/permissoes', async (req, res) => {
+  const { id } = req.params;
+  const userId = parseInt(id, 10);
+  const { permissoes } = req.body; // array de strings: ['obras.listar', 'financeiro.notas.lancar', ...]
+
+  if (isNaN(userId) || !Array.isArray(permissoes)) {
+    return res.status(400).json({ error: 'Dados inválidos' });
+  }
+
+  try {
+    // 1. Deletar permissões antigas
+    await supabase
+      .from('permissoes_usuario')
+      .delete()
+      .eq('usuario_id', userId);
+
+    // 2. Inserir novas permissões
+    if (permissoes.length > 0) {
+      const novasPermissoes = permissoes.map(tela => ({
+        usuario_id: userId,
+        tela,
+        acao: 'visualizar' // ou 'editar', se quiser
+      }));
+      const { error } = await supabase
+        .from('permissoes_usuario')
+        .insert(novasPermissoes);
+      if (error) throw error;
+    }
+
+    res.status(200).json({ message: 'Permissões atualizadas com sucesso' });
+  } catch (error) {
+    console.error('Erro ao salvar permissões:', error);
+    res.status(500).json({ error: 'Erro ao salvar permissões' });
+  }
+});
+
+// POST /users/:id/obras — Salvar obras autorizadas para o usuário
+app.post('/users/:id/obras', async (req, res) => {
+  const { id } = req.params;
+  const userId = parseInt(id, 10);
+  const { obras } = req.body; // array de números: [1, 5, 8]
+
+  if (isNaN(userId) || !Array.isArray(obras)) {
+    return res.status(400).json({ error: 'Dados inválidos' });
+  }
+
+  try {
+    // 1. Deletar acesso antigo
+    await supabase
+      .from('acesso_obras_usuario')
+      .delete()
+      .eq('usuario_id', userId);
+
+    // 2. Inserir novo acesso
+    if (obras.length > 0) {
+      const novosAcessos = obras.map(obra_id => ({
+        usuario_id: userId,
+        obra_id: parseInt(obra_id, 10)
+      }));
+      const { error } = await supabase
+        .from('acesso_obras_usuario')
+        .insert(novosAcessos);
+      if (error) throw error;
+    }
+
+    res.status(200).json({ message: 'Obras autorizadas atualizadas com sucesso' });
+  } catch (error) {
+    console.error('Erro ao salvar obras autorizadas:', error);
+    res.status(500).json({ error: 'Erro ao salvar obras autorizadas' });
+  }
+});
+
+// ========================
+// ROTAS DE SUPRIMENTOS
+// ========================
+
+// GET /fornecedores
+app.get('/fornecedores', async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('fornecedores')
+      .select('*')
+      .order('nome_fantasia', { ascending: true });
+
+    if (error) throw error;
+    res.json(data);
+  } catch (err) {
+    console.error('Erro ao buscar fornecedores:', err);
+    res.status(500).json({ error: 'Erro ao buscar fornecedores' });
+  }
+});
+
+// PDF: GET /fornecedores/pdf — Exportar lista completa de fornecedores
+app.get('/fornecedores/pdf', async (req, res) => {
+  try {
+    const { data: fornecedores, error } = await supabase
+      .from('fornecedores')
+      .select('*')
+      .order('nome_fantasia', { ascending: true });
+
+    if (error) throw error;
+
+  // Gerar HTML com layout otimizado para A4 paisagem
+const html = `
+  <!DOCTYPE html>
+  <html>
+  <head>
+    <meta charset="utf-8">
+    <title>Lista de Fornecedores - Minhas Obras</title>
+    <style>
+      @page {
+        size: A4 landscape;
+        margin: 10mm;
+      }
+      body { 
+        font-family: Arial, sans-serif; 
+        font-size: 8pt; 
+        color: #333; 
+        line-height: 1.1;
+      }
+      h1 { 
+        color: #1e3a8a; 
+        text-align: center; 
+        margin-bottom: 12px; 
+        font-size: 12pt;
+        page-break-after: avoid;
+      }
+      table { 
+        width: 100%; 
+        border-collapse: collapse; 
+        margin-top: 8px; 
+        table-layout: fixed;
+      }
+      th, td {
+        border: 1px solid #999;
+        padding: 4px;
+        vertical-align: top;
+        overflow: hidden;
+        word-wrap: break-word;
+      }
+      th {
+        background-color: #f1f5f9;
+        font-weight: bold;
+        text-align: center;
+        font-size: 8pt;
+      }
+      td {
+        font-size: 7.5pt;
+        padding: 3px 4px;
+      }
+      /* Largura proporcional das colunas */
+      .col-id { width: 5%; }
+      .col-razao { width: 15%; }
+      .col-fantasia { width: 12%; }
+      .col-cnpj { width: 10%; }
+      .col-email { width: 12%; }
+      .col-tel { width: 10%; }
+      .col-endereco { width: 26%; }
+    </style>
+  </head>
+  <body>
+    <h1>LISTA DE FORNECEDORES</h1>
+    <table>
+      <thead>
+        <tr>
+          <th class="col-id">ID</th>
+          <th class="col-razao">Razão Social</th>
+          <th class="col-fantasia">Nome Fantasia</th>
+          <th class="col-cnpj">CNPJ</th>
+          <th class="col-email">E-mail</th>
+          <th class="col-tel">Telefone</th>
+          <th class="col-endereco">Endereço</th>
+        </tr>
+      </thead>
+      <tbody>
+        ${fornecedores.map(f => `
+          <tr>
+            <td class="col-id">#${f.id}</td>
+            <td class="col-razao">${f.razao_social || '—'}</td>
+            <td class="col-fantasia">${f.nome_fantasia || '—'}</td>
+            <td class="col-cnpj">${f.cnpj || '—'}</td>
+            <td class="col-email">${f.email || '—'}</td>
+            <td class="col-tel">${f.telefone || '—'}</td>
+            <td class="col-endereco">
+              ${[f.logradouro, f.numero, f.complemento, f.bairro, f.cidade, f.uf]
+                .filter(Boolean)
+                .join(', ') || '—'}
+            </td>
+          </tr>
+        `).join('')}
+      </tbody>
+    </table>
+  </body>
+  </html>
+`;
+
+    pdf.create(html, {
+  format: 'A4',
+  orientation: 'landscape',
+  border: '10mm'
+}).toBuffer((err, buffer) => {
+  if (err) {
+    console.error('Erro ao gerar PDF com html-pdf:', err);
+    return res.status(500).json({ error: 'Erro ao gerar PDF' });
+  }
+  res.setHeader('Content-Type', 'application/pdf');
+  res.setHeader('Content-Disposition', `inline; filename=fornecedores.pdf`);
+  res.send(buffer);
+});
+  } catch (error) {
+    console.error('Erro na exportação PDF de fornecedores:', error);
+    res.status(500).json({ error: 'Erro interno ao gerar PDF' });
+  }
+});
+
+// GET /fornecedores/:id
+app.get('/fornecedores/:id', async (req, res) => {
+  const { id } = req.params;
+  const fornecedorId = parseInt(id, 10);
+  if (isNaN(fornecedorId)) {
+    return res.status(400).json({ error: 'ID do fornecedor inválido' });
+  }
+  try {
+    const { data, error } = await supabase
+      .from('fornecedores')
+      .select('*')
+      .eq('id', fornecedorId)
+      .single();
+    if (error || !data) {
+      return res.status(404).json({ error: 'Fornecedor não encontrado' });
+    }
+    res.json(data);
+  } catch (error) {
+    console.error('Erro ao buscar fornecedor:', error);
+    res.status(500).json({ error: 'Erro interno ao buscar fornecedor' });
+  }
+});
+
+// POST /fornecedores
+app.post('/fornecedores', async (req, res) => {
+  try {
+    const {
+      nome_fantasia,
+      razao_social,
+      cnpj,
+      inscricao_estadual,
+      telefone,
+      email,
+      cep,
+      logradouro,
+      numero,
+      complemento,
+      bairro,
+      cidade,
+      uf
+    } = req.body;
+
+    if (!nome_fantasia || !razao_social) {
+      return res.status(400).json({ error: 'Nome fantasia e razão social são obrigatórios' });
+    }
+
+    const { data, error } = await supabase
+      .from('fornecedores')
+      .insert([{
+        nome_fantasia,
+        razao_social,
+        cnpj: cnpj || null,
+        inscricao_estadual: inscricao_estadual || null,
+        telefone: telefone || null,
+        email: email || null,
+        cep: cep || null,
+        logradouro: logradouro || null,
+        numero: numero || null,
+        complemento: complemento || null,
+        bairro: bairro || null,
+        cidade: cidade || null,
+        uf: uf || null
+      }])
+      .select();
+
+    if (error) throw error;
+    res.status(201).json(data[0]);
+  } catch (err) {
+    console.error('Erro ao criar fornecedor:', err);
+    res.status(500).json({ error: 'Erro ao criar fornecedor' });
+  }
+});
+
+// PUT /fornecedores/:id
+app.put('/fornecedores/:id', async (req, res) => {
+  const { id } = req.params;
+  const fornecedorId = parseInt(id, 10);
+
+  if (isNaN(fornecedorId)) {
+    return res.status(400).json({ error: 'ID do fornecedor inválido' });
+  }
+
+  try {
+    const {
+      nome_fantasia,
+      razao_social,
+      cnpj,
+      inscricao_estadual,
+      telefone,
+      email,
+      cep,
+      logradouro,
+      numero,
+      complemento,
+      bairro,
+      cidade,
+      uf
+    } = req.body;
+
+    if (!nome_fantasia || !razao_social) {
+      return res.status(400).json({ error: 'Nome fantasia e razão social são obrigatórios' });
+    }
+
+    const { data, error } = await supabase
+      .from('fornecedores')
+      .update({
+        nome_fantasia,
+        razao_social,
+        cnpj: cnpj || null,
+        inscricao_estadual: inscricao_estadual || null,
+        telefone: telefone || null,
+        email: email || null,
+        cep: cep || null,
+        logradouro: logradouro || null,
+        numero: numero || null,
+        complemento: complemento || null,
+        bairro: bairro || null,
+        cidade: cidade || null,
+        uf: uf || null
+      })
+      .eq('id', fornecedorId)
+      .select();
+
+    if (error) {
+      console.error('Erro ao atualizar fornecedor:', error);
+      return res.status(500).json({ error: 'Erro ao atualizar fornecedor' });
+    }
+
+    if (!data || data.length === 0) {
+      return res.status(404).json({ error: 'Fornecedor não encontrado' });
+    }
+
+    res.json(data[0]);
+  } catch (error) {
+    console.error('Erro interno ao atualizar fornecedor:', error);
+    res.status(500).json({ error: 'Erro interno' });
+  }
+});
+
+// DELETE /fornecedores/:id
+app.delete('/fornecedores/:id', async (req, res) => {
+  const { id } = req.params;
+  const fornecedorId = parseInt(id, 10);
+
+  if (isNaN(fornecedorId)) {
+    return res.status(400).json({ error: 'ID do fornecedor inválido' });
+  }
+
+  try {
+    const { error } = await supabase
+      .from('fornecedores')
+      .delete()
+      .eq('id', fornecedorId);
+
+    if (error) {
+      console.error('Erro ao deletar fornecedor:', error);
+      return res.status(500).json({ error: 'Erro ao deletar fornecedor' });
+    }
+
+    res.status(204).send();
+  } catch (error) {
+    console.error('Erro interno ao deletar fornecedor:', error);
+    res.status(500).json({ error: 'Erro interno' });
+  }
+});
+
+// GET /pedidos-compra — com dados da obra e fornecedor
+app.get('/pedidos-compra', async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('pedidos_compra')
+      .select(`
+        *,
+        obras (nome),
+        fornecedores (nome_fantasia)
+      `)
+      .order('created_at', { ascending: false });
+
+    if (error) {
+      console.error('Erro do Supabase:', error);
+      return res.status(500).json({ error: 'Erro ao buscar pedidos' });
+    }
+    res.json(data || []);
+  } catch (err) {
+    console.error('Erro interno:', err.message);
+    res.status(500).json({ error: 'Erro interno' });
+  }
+});
+
+// POST /pedidos-compra
+app.post('/pedidos-compra', async (req, res) => {
+  try {
+    const {
+      obra_id,
+      fornecedor_id,
+      data_pedido,
+      frete = 0,
+      cidade,
+      uf,
+      itens = [],
+      observacoes = ''
+    } = req.body;
+
+    if (!obra_id || !fornecedor_id || !itens.length) {
+      return res.status(400).json({ error: 'Obra, fornecedor e pelo menos um item são obrigatórios' });
+    }
+
+    // Gerar código sequencial: PC-0001, PC-0002, ...
+    const { data: ultimoPedido } = await supabase
+      .from('pedidos_compra')
+      .select('id')
+      .order('id', { ascending: false })
+      .limit(1)
+      .single();
+
+    const proximoNumero = ultimoPedido ? ultimoPedido.id + 1 : 1;
+    const codigo = `PC-${String(proximoNumero).padStart(4, '0')}`;
+
+    // Salvar pedido
+    const { data, error } = await supabase
+      .from('pedidos_compra')
+      .insert([{
+        obra_id: parseInt(obra_id),
+        fornecedor_id: parseInt(fornecedor_id),
+        data_pedido: data_pedido || new Date().toISOString().split('T')[0],
+        frete: parseFloat(frete) || 0,
+        cidade: cidade || null,
+        uf: uf || null,
+        itens: itens,
+        observacoes: observacoes || null,
+        codigo: codigo
+      }])
+      .select();
+
+    if (error) throw error;
+
+    const pedidoSalvo = data[0]; // ✅ Agora temos o pedido salvo
+
+      // ✅ Só agora responde ao frontend
+    return res.status(201).json(pedidoSalvo);
+
+  } catch (err) {
+    console.error('Erro ao criar pedido:', err);
+    return res.status(500).json({ error: 'Erro ao criar pedido' });
+  }
+});
+
+// PUT /pedidos-compra/:id
+app.put('/pedidos-compra/:id', async (req, res) => {
+  const { id } = req.params;
+  const pedidoId = parseInt(id, 10);
+
+  if (isNaN(pedidoId)) {
+    return res.status(400).json({ error: 'ID do pedido inválido' });
+  }
+
+  try {
+    const {
+      obra_id,
+      fornecedor_id,
+      data_pedido,
+      frete = 0,
+      cidade,
+      uf,
+      itens = [],
+      observacoes = ''
+    } = req.body;
+
+    const { data, error } = await supabase
+      .from('pedidos_compra')
+      .update({
+        obra_id: parseInt(obra_id),
+        fornecedor_id: parseInt(fornecedor_id),
+        data_pedido: data_pedido,
+        frete: parseFloat(frete) || 0,
+        cidade: cidade || null,
+        uf: uf || null,
+        itens: itens,
+        observacoes: observacoes || null
+      })
+      .eq('id', pedidoId)
+      .select();
+
+    if (error) throw error;
+    if (!data || data.length === 0) {
+      return res.status(404).json({ error: 'Pedido não encontrado' });
+    }
+
+    res.json(data[0]);
+  } catch (err) {
+    console.error('Erro ao atualizar pedido:', err);
+    res.status(500).json({ error: 'Erro ao atualizar pedido' });
+  }
+});
+
+// GET /pedidos-compra/:id
+app.get('/pedidos-compra/:id', async (req, res) => {
+  const { id } = req.params;
+  const pedidoId = parseInt(id, 10);
+
+  if (isNaN(pedidoId)) {
+    return res.status(400).json({ error: 'ID do pedido inválido' });
+  }
+
+  try {
+    const { data, error } = await supabase
+      .from('pedidos_compra')
+      .select(`
+        *,
+        obras (nome),
+        fornecedores (nome_fantasia)
+      `)
+      .eq('id', pedidoId)
+      .single();
+
+    if (error) {
+      console.error('Erro ao buscar pedido:', error);
+      return res.status(404).json({ error: 'Pedido não encontrado' });
+    }
+
+    res.json(data);
+  } catch (err) {
+    console.error('Erro interno ao buscar pedido:', err.message);
+    res.status(500).json({ error: 'Erro interno' });
+  }
+});
+
+// PDF: GET /diarios-obras/:id/pdf — COM LOGO EMBUTIDO EM BASE64
+app.get('/diarios-obras/:id/pdf', async (req, res) => {
+  const { id } = req.params;
+  const diarioId = parseInt(id, 10);
+  if (isNaN(diarioId)) {
+    return res.status(400).json({ error: 'ID inválido' });
+  }
+  let browser;
+  try {
+    // === LOGO EMBUTIDO (COLADO AQUI) ===
+    const LOGO_BASE64 = 'data:image/png;base64,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'
+
+    // Buscar diário
+    const { data: diario, error: diarioError } = await supabase
+      .from('diarios_obras')
+      .select('*')
+      .eq('id', diarioId)
+      .single();
+    if (diarioError || !diario) {
+      return res.status(404).json({ error: 'Diário não encontrado' });
+    }
+    // Buscar obra
+    let obra = { nome: '—', endereco: '—', "A R T": '—', cno: '—', eng_responsavel: '—' };
+    if (diario.obra_id) {
+      const { data, error } = await supabase
+        .from('obras')
+        .select('nome, endereco, "A R T", cno, eng_responsavel')
+        .eq('id', diario.obra_id)
+        .single();
+      if (data) obra = data;
+    }
+    // Processar imagens para Base64 (para as imagens do diário)
+    const imagens = Array.isArray(diario.imagens) ? diario.imagens : [];
+    const imagensBase64 = [];
+    for (const caminho of imagens) {
+      if (!caminho) continue;
+      let urlPublica;
+      if (caminho.startsWith('http://') || caminho.startsWith('https://')) {
+        urlPublica = caminho;
+      } else {
+        urlPublica = `${supabaseUrl}/storage/v1/object/public/${caminho}`;
+      }
+      try {
+        const response = await fetch(urlPublica);
+        if (!response.ok) continue;
+        const arrayBuffer = await response.arrayBuffer();
+        const base64 = Buffer.from(arrayBuffer).toString('base64');
+        const contentType = response.headers.get('content-type') || 'image/jpeg';
+        imagensBase64.push(`data:${contentType};base64,${base64}`);
+      } catch (err) {
+        console.warn('❌ Falha ao processar imagem:', caminho, err.message);
+      }
+    }
+    // Formatar dados
+    const atividades = Array.isArray(diario.atividades) ? diario.atividades : [];
+    const efetivos = Array.isArray(diario.efetivos) ? diario.efetivos : [];
+    const turnos = diario.turnos || { manha: '', tarde: '', noite: '' };
+    const observacoes = diario.observacoes || '';
+    const status = diario.status || 'Revisar';
+    const dataFormatada = diario.data ? new Date(diario.data).toLocaleDateString('pt-BR') : '—';
+    const statusColor = status === 'Aprovado' ? '#10b981' : status === 'Reprovado' ? '#ef4444' : '#f59e0b';
+    const statusBg = status === 'Aprovado' ? '#ecfdf5' : status === 'Reprovado' ? '#fef2f2' : '#fffbeb';
+    // Gerar HTML
+    const html = `
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <meta charset="utf-8">
+        <title>Diário de Obra ${diarioId}</title>
+        <style>
+          body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; font-size: 10pt; margin: 0; padding: 0; color: #333; }
+          .container { width: 210mm; margin: 0 auto; padding: 15mm; box-sizing: border-box; }
+          .header { text-align: center; margin-bottom: 20px; padding-bottom: 15px; border-bottom: 3px solid #1e40af; }
+          .header img { height: 50px; margin-bottom: 10px; }
+          .header h1 { font-size: 18pt; margin: 5px 0; color: #1e3a8a; font-weight: 700; }
+          .title { text-align: center; font-weight: bold; font-size: 14pt; margin: 20px 0 25px; color: #1e3a8a; text-decoration: underline; }
+          .section { margin: 18px 0; }
+          .section-title { font-weight: bold; margin-bottom: 10px; font-size: 11pt; color: #1e3a8a; display: flex; align-items: center; }
+          .section-title::before { content: "•"; color: #1e40af; font-size: 20pt; margin-right: 8px; }
+          .turno-box { background: white; border: 1px solid #94a3b8; border-radius: 6px; padding: 10px; margin: 8px 0; min-height: 30px; font-size: 9.5pt; }
+          table { width: 100%; border-collapse: collapse; margin-top: 6px; }
+          th, td { border: 1px solid #cbd5e1; padding: 8px; font-size: 9pt; text-align: left; }
+          th { background-color: #dbeafe; font-weight: bold; color: #1e40af; }
+          .status-box { text-align: center; font-weight: bold; margin-top: 25px; padding: 12px; background-color: ${statusBg}; border: 2px solid ${statusColor}; border-radius: 8px; color: ${statusColor}; font-size: 12pt; }
+          .imagens-section { margin-top: 25px; }
+          .images-grid {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 12px;
+            margin-top: 10px;
+          }
+          .image-item {
+            width: calc((210mm - 30mm - 24px) / 3);
+            height: 80mm;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            box-sizing: border-box;
+          }
+          .image-item img {
+            max-width: 100%;
+            max-height: 100%;
+            object-fit: contain;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+          }
+          .no-images { color: #64748b; font-style: italic; }
+        </style>
+      </head>
+      <body>
+        <div class="container">
+          <div class="header">
+            <img src="${LOGO_BASE64}" alt="Logo da Empresa">
+            <h1>ERP MINHAS OBRAS</h1>
+          </div>
+          <div class="title">RELATÓRIO DIÁRIO DE OBRA (RDO)</div>
+          <div class="section">
+            <strong>OBRA:</strong> ${obra.nome}<br>
+            <strong>ENDEREÇO:</strong> ${obra.endereco}<br>
+            <strong>ART:</strong> ${obra['A R T'] || '—'}<br>
+            <strong>CNO:</strong> ${obra.cno || '—'}<br>
+            <strong>RESP. TÉCNICO:</strong> ${obra.eng_responsavel}<br>
+            <strong>DATA:</strong> ${dataFormatada}
+          </div>
+          <div class="section">
+            <div class="section-title">TURNOS</div>
+            <div class="turno-box"><strong>Manhã:</strong> ${turnos.manha || '—'}</div>
+            <div class="turno-box"><strong>Tarde:</strong> ${turnos.tarde || '—'}</div>
+            <div class="turno-box"><strong>Noite:</strong> ${turnos.noite || '—'}</div>
+          </div>
+          <div class="section">
+            <div class="section-title">EQUIPES (EFETIVOS)</div>
+            <table>
+              <thead><tr><th>Função / Nome</th></tr></thead>
+              <tbody>
+                ${(efetivos.length > 0 ? efetivos.map(e => `<tr><td>${e}</td></tr>`).join('') : '<tr><td>—</td></tr>')}
+              </tbody>
+            </table>
+          </div>
+          <div class="section">
+            <div class="section-title">TAREFAS REALIZADAS</div>
+            <table>
+              <thead><tr><th>Descrição</th></tr></thead>
+              <tbody>
+                ${(atividades.length > 0 ? atividades.map(a => `<tr><td>${a}</td></tr>`).join('') : '<tr><td>—</td></tr>')}
+              </tbody>
+            </table>
+          </div>
+          <div class="section">
+            <div class="section-title">OCORRÊNCIAS</div>
+            <table>
+              <thead><tr><th>Descrição</th></tr></thead>
+              <tbody>
+                <tr><td>${observacoes || '—'}</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <!-- MAPA DE CHUVAS -->
+          <div class="section">
+            <div class="section-title">MAPA DE CHUVAS</div>
+            <table>
+              <thead><tr><th>Dias Improdutivos (Chuvosos)</th><th>Total de Dias Úteis</th></tr></thead>
+              <tbody>
+                <tr>
+                  <td>
+                    ${(Array.isArray(diario.dias_improdutivos) && diario.dias_improdutivos.length > 0
+                      ? diario.dias_improdutivos.map(d => d.toString().padStart(2, '0')).join(', ')
+                      : 'Nenhum')}
+                  </td>
+                  <td>
+                    ${(function() {
+                      if (!diario.data) return '—';
+                      const ano = parseInt(diario.data.substring(0, 4), 10);
+                      const mes = parseInt(diario.data.substring(5, 7), 10) - 1;
+                      const totalDias = new Date(ano, mes + 1, 0).getDate();
+                      const diasUteis = totalDias - (Array.isArray(diario.dias_improdutivos) ? diario.dias_improdutivos.length : 0);
+                      return `${diasUteis} / ${totalDias}`;
+                    })()}
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <!-- PREENCHEDOR -->
+          <div class="section">
+            <div class="section-title">ELABORADO POR</div>
+            <p><strong>Usuário:</strong> ${diario.elaborado_por || '—'}</p>
+          </div>
+          <!-- IMAGENS DA OBRA -->
+          <div class="section imagens-section" style="page-break-before: always;">
+            <div class="section-title" style="page-break-after: avoid;">IMAGENS DA OBRA</div>
+            ${imagensBase64.length > 0
+              ? `<div class="images-grid" style="margin-top: 20px;">${imagensBase64.map(src => `<div class="image-item"><img src="${src}" alt="Imagem da Obra"></div>`).join('')}</div>`
+              : '<p class="no-images">Nenhuma imagem anexada.</p>'
+            }
+          </div>
+          <div class="status-box">
+            STATUS: ${status.toUpperCase()}
+          </div>
+        </div>
+      </body>
+      </html>
+    `;
+    // Gerar PDF
+    browser = await puppeteer.launch({ headless: true });
+    const page = await browser.newPage();
+    await page.setViewport({ width: 1200, height: 800 });
+    await page.setContent(html, { waitUntil: 'domcontentloaded', timeout: 0 });
+    const pdfBuffer = await page.pdf({ format: 'A4', printBackground: true });
+    await browser.close();
+    // Enviar PDF
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `inline; filename=diario-${diarioId}.pdf`);
+    res.end(pdfBuffer);
+  } catch (error) {
+    console.error('❌ Erro ao gerar PDF:', error);
+    if (browser) await browser.close().catch(() => {});
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'Erro interno ao gerar PDF' });
+    }
+  }
+});
+
+ //ROTA PEDIDOS DE COMPRAS - PDF
+
+// PDF: GET /pedidos-compra/:id/pdf — COM LOGO DA EMPRESA
+app.get('/pedidos-compra/:id/pdf', async (req, res) => {
+  const { id } = req.params;
+  const pedidoId = parseInt(id, 10);
+
+  if (isNaN(pedidoId) || pedidoId <= 0) {
+    return res.status(400).json({ error: 'ID inválido' });
+  }
+
+  try {
+    // === 🔑 COLE SEU LOGO EM BASE64 AQUI ===
+    const LOGO_BASE64 = 'data:image/png;base64,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'
+
+
+    // Buscar pedido
+    const { data: pedido, error: pedidoError } = await supabase
+      .from('pedidos_compra')
+      .select('*')
+      .eq('id', pedidoId)
+      .single();
+
+    if (pedidoError || !pedido) {
+      return res.status(404).json({ error: 'Pedido não encontrado' });
+    }
+
+    // Buscar obra e fornecedor
+    const [obraRes, fornecedorRes] = await Promise.all([
+      supabase.from('obras').select('nome, proprietario, endereco').eq('id', pedido.obra_id).single(),
+      supabase.from('fornecedores').select('nome_fantasia, razao_social, cnpj').eq('id', pedido.fornecedor_id).single()
+    ]);
+
+    const obra = obraRes.data || { nome: '—', proprietario: '—', endereco: '—' };
+    const fornecedor = fornecedorRes.data || { razao_social: '—', nome_fantasia: '—', cnpj: '—' };
+    const itens = Array.isArray(pedido.itens) ? pedido.itens : [];
+    const codigo = pedido.codigo || `PC-${String(pedido.id).padStart(4, '0')}`;
+
+    // Gerar HTML com logo
+    const html = `
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <meta charset="utf-8">
+        <title>Pedido de Compra ${codigo}</title>
+        <style>
+          body { font-family: Arial, sans-serif; margin: 40px; }
+          .header-container { 
+            display: flex; 
+            align-items: center; 
+            gap: 15px; 
+            margin-bottom: 30px; 
+            padding-bottom: 20px; 
+            border-bottom: 2px solid #1e3a8a; 
+          }
+          .header-logo { height: 40px; }
+          h1 { color: #1e3a8a; margin: 0; font-size: 24pt; }
+          table { width: 100%; border-collapse: collapse; margin-top: 15px; }
+          th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+          th { background-color: #f1f5f9; }
+          .section { margin: 20px 0 10px; font-weight: bold; }
+        </style>
+      </head>
+      <body>
+        <div class="header-container">
+          <img src="${LOGO_BASE64}" alt="Logo da Empresa" class="header-logo">
+          <div>
+            <h1>ERP MINHAS OBRAS</h1>
+            <p style="margin: 4px 0; font-size: 12pt; color: #4b5563;">Pedido de Compra</p>
+          </div>
+        </div>
+
+        <div class="header" style="text-align: right; margin-bottom: 20px;">
+          Código: ${codigo}
+        </div>
+
+        <div class="section">DADOS DA OBRA</div>
+        <p><strong>Obra:</strong> ${obra.nome}<br>
+           <strong>Cliente:</strong> ${obra.proprietario}<br>
+           <strong>Endereço:</strong> ${obra.endereco}</p>
+
+        <div class="section">FORNECEDOR</div>
+        <p><strong>Razão Social:</strong> ${fornecedor.razao_social}<br>
+           <strong>Nome Fantasia:</strong> ${fornecedor.nome_fantasia}<br>
+           <strong>CNPJ:</strong> ${fornecedor.cnpj}</p>
+
+        <div class="section">ITENS</div>
+        <table>
+          <thead>
+            <tr>
+              <th>Item</th>
+              <th>Descrição</th>
+              <th>Qtd</th>
+              <th>Unid.</th>
+              <th>Vlr Unit.</th>
+              <th>Impostos</th>
+              <th>Total</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${itens.length > 0 
+              ? itens.map((item, i) => `
+                <tr>
+                  <td>${i + 1}</td>
+                  <td>${item.descricao || '—'}</td>
+                  <td>${item.quantidade || '—'}</td>
+                  <td>${item.unidade || '—'}</td>
+                  <td>R$ ${(parseFloat(item.valor_unitario) || 0).toFixed(2).replace('.', ',')}</td>
+                  <td>R$ ${(parseFloat(item.impostos) || 0).toFixed(2).replace('.', ',')}</td>
+                  <td>R$ ${(parseFloat(item.valor_total) || 0).toFixed(2).replace('.', ',')}</td>
+                </tr>
+              `).join('')
+              : `<tr><td colspan="7" style="text-align:center">Nenhum item cadastrado</td></tr>`
+            }
+          </tbody>
+        </table>
+
+        <p style="margin-top: 20px;"><strong>Frete:</strong> R$ ${(parseFloat(pedido.frete) || 0).toFixed(2).replace('.', ',')}</p>
+        <p><strong>Valor Total do Pedido:</strong> R$ ${(itens.reduce((sum, item) => sum + (parseFloat(item.valor_total) || 0), 0) + (parseFloat(pedido.frete) || 0)).toFixed(2).replace('.', ',')}</p>
+      </body>
+      </html>
+    `;
+
+    // Gerar PDF
+    pdf.create(html).toBuffer((err, buffer) => {
+      if (err) {
+        console.error('Erro ao gerar PDF com html-pdf:', err);
+        return res.status(500).json({ error: 'Erro ao gerar PDF' });
+      }
+      res.setHeader('Content-Type', 'application/pdf');
+      res.setHeader('Content-Disposition', `inline; filename=pedido-${codigo}.pdf`);
+      res.send(buffer);
+    });
+
+  } catch (error) {
+    console.error('[PDF] Erro:', error);
+    res.status(500).json({ error: 'Erro interno ao gerar PDF' });
+  }
+});
+
+// DELETE /pedidos-compra/:id
+app.delete('/pedidos-compra/:id', async (req, res) => {
+  const { id } = req.params;
+  const pedidoId = parseInt(id, 10);
+
+  if (isNaN(pedidoId)) {
+    return res.status(400).json({ error: 'ID do pedido inválido' });
+  }
+
+  try {
+    const { error } = await supabase
+      .from('pedidos_compra')
+      .delete()
+      .eq('id', pedidoId);
+
+    if (error) {
+      console.error('Erro ao deletar pedido:', error);
+      return res.status(500).json({ error: 'Erro ao deletar pedido' });
+    }
+
+    res.status(204).send(); // No Content
+  } catch (error) {
+    console.error('Erro interno ao deletar pedido:', error);
+    res.status(500).json({ error: 'Erro interno' });
+  }
+});
+
+// PUT /users/:id
+app.put('/users/:id', async (req, res) => {
+  const { id } = req.params;
+  const userId = parseInt(id, 10);
+
+  if (isNaN(userId)) {
+    return res.status(400).json({ error: 'ID de usuário inválido' });
+  }
+
+  try {
+    const { name, email, role, permissions, password } = req.body;
+
+    if (!name || !email) {
+      return res.status(400).json({ error: 'Nome e e-mail são obrigatórios' });
+    }
+
+    const updateData = { name, email, role, permissions };
+
+    // ✅ Só criptografa se for uma senha em texto claro (não um hash)
+    if (password && password.length < 60) { // hashes bcrypt têm ~60 caracteres
+      updateData.password = await bcrypt.hash(password, 10);
+    }
+    // Se password tiver 60+ chars, é um hash → ignora (não recriptografa)
+
+    const { data, error } = await supabase
+      .from('usuarios')
+      .update(updateData)
+      .eq('id', userId)
+      .select();
+
+    if (error) {
+      console.error('Erro ao atualizar usuário:', error);
+      return res.status(500).json({ error: 'Erro ao atualizar usuário' });
+    }
+
+    if (!data || data.length === 0) {
+      return res.status(404).json({ error: 'Usuário não encontrado' });
+    }
+
+    // 🔒 Remover senha da resposta
+    const { password: _, ...usuarioSemSenha } = data[0];
+    res.json(usuarioSemSenha);
+  } catch (error) {
+    console.error('Erro ao atualizar usuário:', error);
+    res.status(500).json({ error: 'Erro interno' });
+  }
+});
+
+// DELETE /users/:id
+app.delete('/users/:id', async (req, res) => {
+  const { id } = req.params;
+  const userId = parseInt(id, 10);
+
+  if (isNaN(userId)) {
+    return res.status(400).json({ error: 'ID de usuário inválido' });
+  }
+
+  try {
+    const { error } = await supabase
+      .from('usuarios')
+      .delete()
+      .eq('id', userId);
+
+    if (error) {
+      console.error('Erro ao deletar usuário:', error);
+      return res.status(500).json({ error: 'Erro ao deletar usuário' });
+    }
+
+    res.status(204).send();
+  } catch (error) {
+    console.error('Erro interno ao deletar usuário:', error);
+    res.status(500).json({ error: 'Erro interno' });
+  }
+});
+
+// POST /users/reset-password — Redefinição com token
+app.post('/users/reset-password', async (req, res) => {
+  try {
+    const { token, userId, newPassword } = req.body;
+
+    if (!token || !userId || !newPassword) {
+      return res.status(400).json({ error: 'Token, ID do usuário e nova senha são obrigatórios' });
+    }
+
+    // Buscar usuário com token válido
+    const { data: user, error } = await supabase
+      .from('usuarios')
+      .select('reset_token, reset_expires_at')
+      .eq('id', userId)
+      .single();
+
+    if (error || !user) {
+      return res.status(400).json({ error: 'Token inválido' });
+    }
+
+    // Verificar token e expiração
+    if (user.reset_token !== token) {
+      return res.status(400).json({ error: 'Token inválido' });
+    }
+
+    const isExpired = new Date() > new Date(user.reset_expires_at);
+    if (isExpired) {
+      return res.status(400).json({ error: 'Token expirado' });
+    }
+
+    // Atualizar senha e limpar token
+    const hashedPassword = await bcrypt.hash(newPassword, 10);
+    const { error: updateError } = await supabase
+      .from('usuarios')
+      .update({ 
+        password: hashedPassword, 
+        reset_token: null, 
+        reset_expires_at: null 
+      })
+      .eq('id', userId);
+
+    if (updateError) {
+      return res.status(500).json({ error: 'Erro ao redefinir senha' });
+    }
+
+    res.json({ message: 'Senha redefinida com sucesso' });
+  } catch (error) {
+    console.error('Erro ao redefinir senha:', error);
+    res.status(500).json({ error: 'Erro interno' });
+  }
+});
+
+// POST /users/forgot-password — Solicitação de recuperação
+app.post('/users/forgot-password', async (req, res) => {
+  try {
+    const { email } = req.body;
+    if (!email) {
+      return res.status(400).json({ error: 'E-mail é obrigatório' });
+    }
+    // Buscar usuário
+    const { data: user, error } = await supabase
+      .from('usuarios')
+      .select('id, name')
+      .eq('email', email)
+      .single();
+    if (error || !user) {
+      return res.json({ message: 'Se o e-mail estiver cadastrado, você receberá um link de recuperação.' });
+    }
+    // Gerar token
+    const resetToken = generateToken();
+    const expiresAt = new Date(Date.now() + 3600000); // 1 hora
+    // Salvar token no banco
+    const { error: updateError } = await supabase
+      .from('usuarios')
+      .update({ reset_token: resetToken, reset_expires_at: expiresAt.toISOString() })
+      .eq('id', user.id);
+    if (updateError) {
+      return res.status(500).json({ error: 'Erro ao gerar token de recuperação' });
+    }
+    // Enviar e-mail
+    const resetUrl = `http://localhost:3000/reset-password?token=${resetToken}&id=${user.id}`;
+    if (transporter) {
+      await transporter.sendMail({
+        from: process.env.SMTP_USER,
+        to: email,
+        subject: 'Recuperação de Senha - ERP Minhas Obras',
+        html: `
+          <h2>Recuperação de Senha - ERP Minhas Obras</h2>
+          <p>Olá ${user.name},</p>
+          <p>Você solicitou a recuperação de senha no <strong>ERP Minhas Obras</strong>. Clique no link abaixo...</p>
+          <a href="${resetUrl}" style="display: inline-block; padding: 10px 20px; background-color: #1e3a8a; color: white; text-decoration: none; border-radius: 5px;">Redefinir Senha</a>
+          <p>O link expira em 1 hora.</p>
+          <p>Se você não solicitou esta ação, ignore este e-mail.</p>
+        `
+      });
+    } else {
+      console.log(`📧 [DEBUG] Token de recuperação para ${email}: ${resetUrl}`);
+    }
+    res.json({ message: 'Se o e-mail estiver cadastrado, você receberá um link de recuperação.' });
+  } catch (error) {
+    console.error('Erro na recuperação de senha:', error);
+    res.status(500).json({ error: 'Erro interno' });
+  }
+});
+
+// ========================
+// ROTA DE LOGIN — CORRIGIDA PARA SENHAS CRIPTOGRAFADAS
+// ========================
+
+app.post('/login', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+
+    if (!email || !password) {
+      return res.status(400).json({ error: 'E-mail e senha são obrigatórios' });
+    }
+
+    const { data, error } = await supabase
+      .from('usuarios')
+      .select('*')
+      .eq('email', email)
+      .single();
+
+    if (error || !data) {
+      return res.status(401).json({ error: 'Credenciais inválidas' });
+    }
+
+    const senhaValida = await bcrypt.compare(password, data.password);
+
+    if (!senhaValida) {
+      return res.status(401).json({ error: 'Credenciais inválidas' });
+    }
+
+    const { password: _, ...usuarioSemSenha } = data;
+
+    res.json({
+      message: 'Login realizado com sucesso',
+      user: usuarioSemSenha
+    });
+  } catch (error) {
+    console.error('Erro no login:', error.message);
+    res.status(500).json({ error: 'Erro interno no servidor' });
+  }
+});
+
+// === DEBUG TEMPORÁRIO: Diagnóstico do PDF ===
+app.get('/debug-pedido/:id', async (req, res) => {
+  const { id } = req.params;
+  const pedidoId = parseInt(id, 10);
+
+  if (!pedidoId || pedidoId <= 0) {
+    return res.status(400).json({ error: 'ID inválido' });
+  }
+
+  try {
+    console.log('🔍 Iniciando diagnóstico para pedido ID:', pedidoId);
+
+    // 1. Buscar pedido
+    const { data: pedido, error: pedidoError } = await supabase
+      .from('pedidos_compra')
+      .select('*')
+      .eq('id', pedidoId)
+      .single();
+
+    if (pedidoError) {
+      console.error('❌ Erro ao buscar pedido:', pedidoError);
+      return res.status(404).json({ error: 'Erro no Supabase ao buscar pedido', details: pedidoError.message });
+    }
+
+    if (!pedido) {
+      console.error('❌ Pedido retornado como nulo');
+      return res.status(404).json({ error: 'Pedido não encontrado (retorno nulo)' });
+    }
+
+    console.log('✅ Pedido encontrado:', {
+      id: pedido.id,
+      codigo: pedido.codigo,
+      obra_id: pedido.obra_id,
+      fornecedor_id: pedido.fornecedor_id,
+      itens_tipo: typeof pedido.itens,
+      itens_valor: pedido.itens
+    });
+
+    // 2. Validar itens
+    let itens = [];
+    if (Array.isArray(pedido.itens)) {
+      itens = pedido.itens;
+    } else if (typeof pedido.itens === 'string') {
+      try {
+        itens = JSON.parse(pedido.itens);
+      } catch (e) {
+        console.error('❌ Falha ao parsear itens como JSON:', e.message);
+        return res.status(500).json({
+          error: 'Itens do pedido estão em formato inválido',
+          rawItens: pedido.itens,
+          parseError: e.message
+        });
+      }
+    } else {
+      console.warn('⚠️ Itens não é array nem string:', typeof pedido.itens, pedido.itens);
+    }
+
+    console.log('✅ Itens validados:', itens.length, 'itens');
+
+    // 3. Testar acesso à obra
+    if (pedido.obra_id) {
+      const { data: obra, error: obraError } = await supabase
+        .from('obras')
+        .select('nome')
+        .eq('id', pedido.obra_id)
+        .single();
+      if (obraError) {
+        console.warn('⚠️ Erro ao buscar obra:', obraError.message);
+      } else {
+        console.log('✅ Obra encontrada:', obra?.nome);
+      }
+    }
+
+    // 4. Testar acesso ao fornecedor
+    if (pedido.fornecedor_id) {
+      const { data: fornecedor, error: fornecedorError } = await supabase
+        .from('fornecedores')
+        .select('nome_fantasia')
+        .eq('id', pedido.fornecedor_id)
+        .single();
+      if (fornecedorError) {
+        console.warn('⚠️ Erro ao buscar fornecedor:', fornecedorError.message);
+      } else {
+        console.log('✅ Fornecedor encontrado:', fornecedor?.nome_fantasia);
+      }
+    }
+
+    // ✅ Tudo OK
+    res.json({
+      success: true,
+      message: 'Pedido válido e pronto para PDF',
+      pedidoId,
+      itensCount: itens.length
+    });
+
+  } catch (err) {
+    console.error('💥 Erro inesperado no diagnóstico:', err);
+    res.status(500).json({ error: 'Erro interno no diagnóstico', message: err.message });
+  }
+});
+
+//ROTA ORÇAMENTOS
+
+// POST /orcamentos — Criar orçamento com hierarquia e valor_total calculado
+app.post('/orcamentos', async (req, res) => {
+  const { obra_id, data_base, taxa_administracao = 0, itens = [] } = req.body;
+
+  if (!obra_id || !itens.length) {
+    return res.status(400).json({ error: 'Obra e pelo menos um item são obrigatórios' });
+  }
+
+  try {
+    console.log('📥 Recebido payload de orçamento:', { obra_id, data_base, taxa_administracao, itens: itens.length });
+
+    // 1. Criar orçamento principal
+    const {  data: orcamento, error: orcError } = await supabase
+      .from('orcamentos')
+      .insert({
+        obra_id: parseInt(obra_id),
+        data_base: data_base || new Date().toISOString().split('T')[0],
+        taxa_administracao: parseFloat(taxa_administracao) || 0
+      })
+      .select()
+      .single();
+
+    if (orcError) {
+      console.error('❌ Erro ao criar orçamento no Supabase:', orcError);
+      return res.status(500).json({ error: 'Erro ao criar orçamento', details: orcError.message });
+    }
+    if (!orcamento) {
+      console.error('❌ Orçamento retornado como nulo');
+      return res.status(500).json({ error: 'Orçamento não criado (retorno nulo)' });
+    }
+
+    console.log('✅ Orçamento criado com ID:', orcamento.id);
+
+    // 2. Inserir itens
+    let ordem = 0;
+    const itensParaInserir = [];
+    let contadorLocal = 0;
+    let contadorEtapa = {};
+    let contadorSubetapa = {};
+
+    for (const item of itens) {
+      if (!item.nivel || !item.descricao) continue;
+
+      ordem++;
+      let codigo = '';
+
+      if (item.nivel === 'local') {
+        contadorLocal++;
+        codigo = String(contadorLocal).padStart(2, '0');
+        contadorEtapa[contadorLocal] = 0;
+        contadorSubetapa[contadorLocal] = {};
+      } else if (item.nivel === 'etapa') {
+        const localId = contadorLocal;
+        contadorEtapa[localId] = (contadorEtapa[localId] || 0) + 1;
+        codigo = `${String(localId).padStart(2, '0')}.${String(contadorEtapa[localId]).padStart(2, '0')}`;
+        contadorSubetapa[localId][contadorEtapa[localId]] = 0;
+      } else if (item.nivel === 'subetapa') {
+        const localId = contadorLocal;
+        const etapaId = contadorEtapa[localId] || 1;
+        contadorSubetapa[localId][etapaId] = (contadorSubetapa[localId][etapaId] || 0) + 1;
+        codigo = `${String(localId).padStart(2, '0')}.${String(etapaId).padStart(2, '0')}.${String(contadorSubetapa[localId][etapaId]).padStart(2, '0')}`;
+      } else if (item.nivel === 'servico') {
+        const localId = contadorLocal;
+        const etapaId = contadorEtapa[localId] || 1;
+        const subetapaId = contadorSubetapa[localId][etapaId] || 1;
+        const servicosNaSubetapa = itensParaInserir.filter(i => 
+          i.codigo.startsWith(`${String(localId).padStart(2, '0')}.${String(etapaId).padStart(2, '0')}.${String(subetapaId).padStart(2, '0')}`)
+        ).length + 1;
+        codigo = `${String(localId).padStart(2, '0')}.${String(etapaId).padStart(2, '0')}.${String(subetapaId).padStart(2, '0')}.${String(servicosNaSubetapa).padStart(2, '0')}`;
+      }
+
+      itensParaInserir.push({
+        orcamento_id: orcamento.id,
+        nivel: item.nivel,
+        codigo,
+        descricao: item.descricao,
+        unidade: item.nivel === 'servico' ? (item.unidade || null) : null,
+        quantidade: item.nivel === 'servico' ? (parseFloat(item.quantidade) || 0) : null,
+        valor_unitario_material: item.nivel === 'servico' ? (parseFloat(item.valor_unitario_material) || 0) : null,
+        valor_unitario_mao_obra: item.nivel === 'servico' ? (parseFloat(item.valor_unitario_mao_obra) || 0) : null,
+        ordem
+      });
+    }
+
+    console.log('📤 Enviando', itensParaInserir.length, 'itens para inserção');
+    const { error: itensError } = await supabase
+      .from('itens_orcamento')
+      .insert(itensParaInserir);
+
+    if (itensError) {
+      console.error('❌ Erro ao inserir itens:', itensError);
+      return res.status(500).json({ error: 'Erro ao salvar itens', details: itensError.message });
+    }
+
+    console.log('✅ Itens inseridos com sucesso');
+
+    // 3. Calcular valor_total via RPC
+    const resultadoRPC = await supabase
+      .rpc('calcular_valor_orcamento', { p_orcamento_id: orcamento.id });
+
+    if (resultadoRPC.error) {
+      console.error('❌ Erro na RPC:', resultadoRPC.error);
+      return res.status(500).json({ error: 'Erro ao calcular valor total', details: resultadoRPC.error.message });
+    }
+
+    // ✅ DECLARAÇÃO CORRETA: antes de qualquer uso
+    const valorCalculado = resultadoRPC.valor_total;
+    console.log('🧮 Valor calculado:', valorCalculado);
+
+    // 4. Atualizar valor_total na tabela orcamentos
+    const { error: updateError } = await supabase
+      .from('orcamentos')
+      .update({ valor_total: valorCalculado })
+      .eq('id', orcamento.id);
+
+    if (updateError) {
+      console.error('❌ Erro ao atualizar valor_total:', updateError);
+      return res.status(500).json({ error: 'Erro ao salvar valor total', details: updateError.message });
+    }
+
+    // ✅ Atualizar valor_previsto na obra vinculada
+const { error: updateObraError } = await supabase
+  .from('obras')
+  .update({ valor_previsto: valorCalculado })
+  .eq('id', obra_id);
+if (updateObraError) {
+  console.warn('⚠️ Falha ao atualizar valor_previsto na obra:', updateObraError);
+}
+
+    console.log('✅ Orçamento finalizado com sucesso');
+    res.status(201).json({ id: orcamento.id, ...orcamento, valor_total: valorCalculado });
+
+  } catch (error) {
+    console.error('💥 Erro CRÍTICO ao criar orçamento:', error);
+    res.status(500).json({ error: 'Erro interno', details: error.message });
+  }
+});
+
+// POST /orcamentos/copiar
+app.post('/orcamentos/copiar', async (req, res) => {
+  // Obter ID do usuário (ajuste conforme sua autenticação)
+  const userId = req.user?.id; 
+  if (!userId) {
+    return res.status(401).json({ error: 'Usuário não autenticado' });
+  }
+
+  const { orcamento_id_origem, obra_id_destino } = req.body;
+  if (!orcamento_id_origem || !obra_id_destino) {
+    return res.status(400).json({ error: 'Parâmetros ausentes' });
+  }
+
+  try {
+    // Buscar orçamento original DO USUÁRIO
+    const {  orcamentoOrigem, error } = await supabase
+      .from('orcamentos')
+      .select('id, obra_id, data_base, taxa_administracao, status')
+      .eq('id', orcamento_id_origem)
+      .eq('usuario_id', userId) // ← FILTRO CRÍTICO
+      .single();
+
+    if (error || !orcamentoOrigem) {
+      console.log('Orçamento não encontrado para o usuário:', { userId, orcamento_id_origem });
+      return res.status(404).json({ error: 'Orçamento não encontrado' });
+    }
+
+    // Criar novo orçamento (com mesmo usuário)
+    const {  novoOrc, insertError } = await supabase
+      .from('orcamentos')
+      .insert([{
+        obra_id: obra_id_destino,
+        data_base: orcamentoOrigem.data_base,
+        taxa_administracao: orcamentoOrigem.taxa_administracao || 0,
+        status: 'Em desenvolvimento',
+        usuario_id: userId // ← VINCULAR AO MESMO USUÁRIO
+      }])
+      .select('id')
+      .single();
+
+    if (insertError) {
+      console.error('Erro ao criar orçamento:', insertError);
+      return res.status(500).json({ error: 'Erro ao criar novo orçamento' });
+    }
+
+    // Copiar itens (mesma lógica)
+    const {  itens, itensError } = await supabase
+      .from('itens_orcamento')
+      .select('*')
+      .eq('orcamento_id', orcamento_id_origem);
+
+    if (!itensError && itens.length > 0) {
+      const novosItens = itens.map(item => ({
+        orcamento_id: novoOrc.id,
+        nivel: item.nivel,
+        codigo: item.codigo,
+        descricao: item.descricao,
+        unidade: item.unidade,
+        quantidade: item.quantidade,
+        valor_unitario_material: item.valor_unitario_material,
+        valor_unitario_mao_obra: item.valor_unitario_mao_obra,
+        ordem: item.ordem,
+        parent_id: null
+      }));
+
+      const { error: insertItensError } = await supabase
+        .from('itens_orcamento')
+        .insert(novosItens);
+
+      if (insertItensError) {
+        console.error('Erro ao copiar itens:', insertItensError);
+        return res.status(500).json({ error: 'Erro ao copiar itens' });
+      }
+    }
+
+    res.status(201).json({ id: novoOrc.id });
+  } catch (error) {
+    console.error('Erro crítico:', error);
+    res.status(500).json({ error: 'Erro interno' });
+  }
+});
+
+// GET /orcamentos/:id/pdf — COM LOGO DA EMPRESA (AJUSTADO)
+app.get('/orcamentos/:id/pdf', async (req, res) => {
+  const { id } = req.params;
+  const orcId = parseInt(id, 10);
+  if (isNaN(orcId)) return res.status(400).json({ error: 'ID inválido' });
+  let browser;
+  try {
+    // === 🔑 COLE O LINK DA SUA IMAGEM AQUI (apenas o link completo) ===
+    const LOGO_BASE64 = 'data:image/png;base64,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'
+
+    console.log('🔍 [PDF] Buscando orçamento ID:', orcId);
+    // 1. Buscar APENAS o orçamento (sem relação)
+    const { data: orcamento, error: orcError } = await supabase
+      .from('orcamentos')
+      .select('id, obra_id, data_base, taxa_administracao, valor_total, status')
+      .eq('id', orcId)
+      .single();
+    if (orcError || !orcamento) {
+      console.error('❌ [PDF] Orçamento não encontrado:', orcError);
+      return res.status(404).json({ error: 'Orçamento não encontrado' });
+    }
+
+    // 2. Buscar obra separadamente (com fallback)
+    let obra = { nome: '—', proprietario: '—', endereco: '—' };
+    if (orcamento.obra_id) {
+      const { data: obraData, error: obraError } = await supabase
+        .from('obras')
+        .select('nome, proprietario, endereco')
+        .eq('id', orcamento.obra_id)
+        .single();
+      if (!obraError && obraData) {
+        obra = obraData;
+      }
+    }
+
+    // 3. Buscar ITENS SEM colunas geradas
+    const { data: itens, error: itensError } = await supabase
+      .from('itens_orcamento')
+      .select('id, nivel, codigo, descricao, unidade, quantidade, valor_unitario_material, valor_unitario_mao_obra, ordem')
+      .eq('orcamento_id', orcId)
+      .order('ordem', { ascending: true });
+    if (itensError) {
+      console.error('❌ [PDF] Erro ao buscar itens:', itensError);
+      return res.status(500).json({ error: 'Erro ao carregar itens' });
+    }
+
+    // 4. Calcular totais manualmente
+    const itensComTotais = itens.map(item => {
+      const qtd = item.quantidade || 0;
+      const mat = item.valor_unitario_material || 0;
+      const mao = item.valor_unitario_mao_obra || 0;
+      return {
+        ...item,
+        total_material: qtd * mat,
+        total_mao_obra: qtd * mao,
+        total_item: qtd * (mat + mao)
+      };
+    });
+
+    // 5. Formatar data
+    const dataBase = orcamento.data_base ? new Date(orcamento.data_base).toLocaleDateString('pt-BR') : '—';
+
+    // 6. Gerar HTML com logo à esquerda
+    const html = `
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <meta charset="utf-8">
+        <title>Orçamento ${orcId}</title>
+        <style>
+          body { font-family: Arial, sans-serif; font-size: 8pt; margin: 0; padding: 0; }
+          .container { width: 210mm; margin: 0 auto; padding: 10mm; box-sizing: border-box; }
+          .header { 
+            display: flex; 
+            align-items: flex-start; 
+            gap: 12px; 
+            margin-bottom: 15px; 
+            border-bottom: 2px solid #1e3a8a; 
+            padding-bottom: 10px; 
+          }
+          .header img { 
+            height: 40px; /* ← Ajuste o tamanho aqui se necessário */
+          }
+          .header .logo-placeholder {
+            height: 40px;
+            width: 120px;
+            background-color: #f1f5f9;
+            border: 1px dashed #94a3b8;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 6pt;
+            color: #64748b;
+          }
+          .header-info { 
+            display: flex; 
+            flex-direction: column; 
+            justify-content: center; 
+          }
+          .header-info h1 { 
+            font-size: 14pt; 
+            color: #1e3a8a; 
+            margin: 0 0 4px 0; 
+          }
+          .header-info p { 
+            font-size: 9pt; 
+            margin: 0; 
+            color: #4b5563; 
+          }
+          .obra-info { margin-bottom: 15px; font-size: 9pt; }
+          table { width: 100%; border-collapse: collapse; margin-top: 10px; }
+          th, td { border: 1px solid #ccc; padding: 4px; vertical-align: top; }
+          th { background-color: #f1f5f9; font-weight: bold; text-align: center; }
+          .totals { margin-top: 20px; font-size: 9pt; }
+          .totals div { margin: 5px 0; }
+        </style>
+      </head>
+      <body>
+        <div class="container">
+          <div class="header">
+            <img src="${LOGO_BASE64}" alt="Logo da Empresa">
+            <h1>ERP MINHAS OBRAS</h1>
+            <p>ORÇAMENTO DE OBRA</p>
+          </div>
+          <div class="obra-info">
+            <strong>Obra:</strong> ${obra.nome}<br>
+            <strong>Cliente:</strong> ${obra.proprietario}<br>
+            <strong>Endereço:</strong> ${obra.endereco}<br>
+            <strong>Data Base:</strong> ${dataBase}
+          </div>
+          <table>
+            <thead>
+              <tr>
+                <th>Cód.</th>
+                <th>Descrição</th>
+                <th>Und</th>
+                <th>Qtd</th>
+                <th>R$ Unit. Mat.</th>
+                <th>R$ Unit. Mão Obra</th>
+                <th>R$ Total Mat.</th>
+                <th>R$ Total Mão Obra</th>
+                <th>R$ Total</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${itensComTotais.map(item => {
+                const indent = item.nivel === 'local' ? 0 :
+                               item.nivel === 'etapa' ? 10 :
+                               item.nivel === 'subetapa' ? 20 : 30;
+                const isServico = item.nivel === 'servico';
+                return `
+                  <tr>
+                    <td style="padding-left: ${indent}px; font-weight: ${item.nivel === 'local' ? 'bold' : 'normal'};">${item.codigo}</td>
+                    <td style="font-weight: ${item.nivel === 'local' ? 'bold' : 'normal'};">${item.descricao}</td>
+                    <td>${isServico ? (item.unidade || '—') : ''}</td>
+                    <td style="text-align: right;">${isServico ? parseFloat(item.quantidade).toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 4 }) : ''}</td>
+                    <td style="text-align: right;">${isServico ? parseFloat(item.valor_unitario_material).toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' }) : ''}</td>
+                    <td style="text-align: right;">${isServico ? parseFloat(item.valor_unitario_mao_obra).toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' }) : ''}</td>
+                    <td style="text-align: right;">${isServico ? parseFloat(item.total_material).toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' }) : ''}</td>
+                    <td style="text-align: right;">${isServico ? parseFloat(item.total_mao_obra).toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' }) : ''}</td>
+                    <td style="text-align: right; font-weight: ${item.nivel === 'local' ? 'bold' : 'normal'};">
+                      ${parseFloat(item.total_item).toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' })}
+                    </td>
+                  </tr>
+                `;
+              }).join('')}
+            </tbody>
+          </table>
+          <div class="totals">
+            <div><strong>Subtotal:</strong> ${parseFloat(
+              itensComTotais
+                .filter(i => i.nivel === 'servico')
+                .reduce((sum, i) => sum + i.total_item, 0)
+            ).toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' })}</div>
+            <div><strong>Taxa de Administração (${orcamento.taxa_administracao || 0}%):</strong> ${parseFloat(
+              itensComTotais
+                .filter(i => i.nivel === 'servico')
+                .reduce((sum, i) => sum + i.total_item, 0) * ((orcamento.taxa_administracao || 0) / 100)
+            ).toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' })}</div>
+            <div style="border-top: 1px solid #000; padding-top: 5px;"><strong>VALOR TOTAL DO ORÇAMENTO:</strong> ${parseFloat(orcamento.valor_total).toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' })}</div>
+          </div>
+        </div>
+      </body>
+      </html>
+    `;
+
+    // 7. Gerar PDF
+    browser = await puppeteer.launch({ headless: true });
+    const page = await browser.newPage();
+    await page.setContent(html, { waitUntil: 'domcontentloaded', timeout: 0 });
+    const pdfBuffer = await page.pdf({ format: 'A4', printBackground: true });
+    await browser.close();
+
+    // 8. Enviar PDF
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `inline; filename=orcamento-${orcId}.pdf`);
+    res.end(pdfBuffer);
+
+  } catch (error) {
+    console.error('❌ [PDF] Erro ao gerar PDF:', error);
+    if (browser) await browser.close().catch(() => {});
+    if (!res.headersSent) {
+      res.status(500).send('Erro ao gerar PDF. Verifique o console do backend.');
+    }
+  }
+});
+
+// GET /orcamentos — Listar orçamentos com obra
+app.get('/orcamentos', async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('orcamentos')
+      .select(`
+        *,
+        obras (nome)
+      `)
+      .order('created_at', { ascending: false });
+    if (error) throw error;
+    res.json(data || []);
+  } catch (err) {
+    console.error('Erro ao listar orçamentos:', err);
+    res.status(500).json({ error: 'Erro ao listar orçamentos' });
+  }
+});
+
+// GET /orcamentos/:id — Buscar orçamento por ID com itens e obra
+app.get('/orcamentos/:id', async (req, res) => {
+  const { id } = req.params;
+  const orcId = parseInt(id, 10);
+  if (isNaN(orcId)) {
+    return res.status(400).json({ error: 'ID de orçamento inválido' });
+  }
+  try {
+    // 1. Buscar orçamento
+    const { data: orcamento, error: orcError } = await supabase
+      .from('orcamentos')
+      .select('*')
+      .eq('id', orcId)
+      .single();
+    if (orcError || !orcamento) {
+      console.error('❌ Orçamento não encontrado:', orcError);
+      return res.status(404).json({ error: 'Orçamento não encontrado' });
+    }
+
+    // 2. Buscar itens do orçamento
+    const { data: itens, error: itensError } = await supabase
+      .from('itens_orcamento')
+      .select('*')
+      .eq('orcamento_id', orcId)
+      .order('ordem', { ascending: true });
+    if (itensError) {
+      console.error('❌ Erro ao carregar itens do orçamento:', itensError);
+      return res.status(500).json({ error: 'Erro ao carregar itens' });
+    }
+
+    // 3. Montar resposta completa
+    const resposta = {
+      ...orcamento,
+      itens: itens || []
+    };
+
+    res.json(resposta);
+  } catch (error) {
+    console.error('💥 Erro interno ao buscar orçamento:', error);
+    res.status(500).json({ error: 'Erro interno ao carregar orçamento' });
+  }
+});
+
+// PUT /orcamentos/:id — Atualizar orçamento existente
+app.put('/orcamentos/:id', async (req, res) => {
+  const { id } = req.params;
+  const orcId = parseInt(id, 10);
+  if (isNaN(orcId)) {
+    return res.status(400).json({ error: 'ID de orçamento inválido' });
+  }
+
+  // ✅ 1. Buscar o orçamento existente para obter o obra_id real (não confiar no req.body)
+  const { data: orcamentoExistente, error: fetchError } = await supabase
+    .from('orcamentos')
+    .select('obra_id')
+    .eq('id', orcId)
+    .single();
+  if (fetchError || !orcamentoExistente) {
+    console.error('Orçamento não encontrado para atualização:', fetchError);
+    return res.status(404).json({ error: 'Orçamento não encontrado' });
+  }
+  const obra_id = orcamentoExistente.obra_id; // ← Sempre vem do banco
+
+  const { data_base, taxa_administracao = 0, status = 'Em desenvolvimento', itens = [] } = req.body;
+  if (!itens || !itens.length) {
+    return res.status(400).json({ error: 'Pelo menos um item é obrigatório' });
+  }
+
+  try {
+    // 2. Atualizar orçamento principal
+    const { error: updateOrcError } = await supabase
+      .from('orcamentos')
+      .update({
+        obra_id: parseInt(obra_id), // garantir número
+        data_base: data_base || new Date().toISOString().split('T')[0],
+        taxa_administracao: parseFloat(taxa_administracao) || 0,
+        status
+      })
+      .eq('id', orcId);
+    if (updateOrcError) {
+      console.error('Erro ao atualizar orçamento:', updateOrcError);
+      return res.status(500).json({ error: 'Erro ao atualizar orçamento' });
+    }
+
+    // 3. Deletar itens antigos e inserir novos
+    await supabase.from('itens_orcamento').delete().eq('orcamento_id', orcId);
+    let ordem = 0;
+    const itensParaInserir = [];
+    let contadorLocal = 0;
+    let contadorEtapa = {};
+    let contadorSubetapa = {};
+    for (const item of itens) {
+      if (!item.nivel || !item.descricao) continue;
+      ordem++;
+      let codigo = '';
+      if (item.nivel === 'local') {
+        contadorLocal++;
+        codigo = String(contadorLocal).padStart(2, '0');
+        contadorEtapa[contadorLocal] = 0;
+        contadorSubetapa[contadorLocal] = {};
+      } else if (item.nivel === 'etapa') {
+        const localId = contadorLocal;
+        contadorEtapa[localId] = (contadorEtapa[localId] || 0) + 1;
+        codigo = `${String(localId).padStart(2, '0')}.${String(contadorEtapa[localId]).padStart(2, '0')}`;
+        contadorSubetapa[localId][contadorEtapa[localId]] = 0;
+      } else if (item.nivel === 'subetapa') {
+        const localId = contadorLocal;
+        const etapaId = contadorEtapa[localId] || 1;
+        contadorSubetapa[localId][etapaId] = (contadorSubetapa[localId][etapaId] || 0) + 1;
+        codigo = `${String(localId).padStart(2, '0')}.${String(etapaId).padStart(2, '0')}.${String(contadorSubetapa[localId][etapaId]).padStart(2, '0')}`;
+      } else if (item.nivel === 'servico') {
+        const localId = contadorLocal;
+        const etapaId = contadorEtapa[localId] || 1;
+        const subetapaId = contadorSubetapa[localId][etapaId] || 1;
+        const servicosNaSubetapa = itensParaInserir.filter(i =>
+          i.codigo.startsWith(`${String(localId).padStart(2, '0')}.${String(etapaId).padStart(2, '0')}.${String(subetapaId).padStart(2, '0')}`)
+        ).length + 1;
+        codigo = `${String(localId).padStart(2, '0')}.${String(etapaId).padStart(2, '0')}.${String(subetapaId).padStart(2, '0')}.${String(servicosNaSubetapa).padStart(2, '0')}`;
+      }
+      itensParaInserir.push({
+        orcamento_id: orcId,
+        nivel: item.nivel,
+        codigo,
+        descricao: item.descricao,
+        unidade: item.nivel === 'servico' ? (item.unidade || null) : null,
+        quantidade: item.nivel === 'servico' ? (parseFloat(item.quantidade) || 0) : null,
+        valor_unitario_material: item.nivel === 'servico' ? (parseFloat(item.valor_unitario_material) || 0) : null,
+        valor_unitario_mao_obra: item.nivel === 'servico' ? (parseFloat(item.valor_unitario_mao_obra) || 0) : null,
+        ordem
+      });
+    }
+    const { error: itensError } = await supabase
+      .from('itens_orcamento')
+      .insert(itensParaInserir);
+    if (itensError) {
+      console.error('Erro ao inserir itens:', itensError);
+      return res.status(500).json({ error: 'Erro ao salvar itens' });
+    }
+
+    // 4. Recalcular valor_total
+    const resultadoRPC = await supabase
+      .rpc('calcular_valor_orcamento', { p_orcamento_id: orcId });
+    if (resultadoRPC.error) {
+      console.error('Erro na RPC:', resultadoRPC.error);
+      return res.status(500).json({ error: 'Erro ao calcular valor total' });
+    }
+    const valorCalculado = resultadoRPC.valor_total;
+
+    // 5. Atualizar valor_total no orçamento
+    await supabase
+      .from('orcamentos')
+      .update({ valor_total: valorCalculado })
+      .eq('id', orcId);
+
+    // ✅ 6. ATUALIZAR valor_previsto NA OBRA VINCULADA (com obra_id do banco)
+    const { error: updateObraError } = await supabase
+      .from('obras')
+      .update({ valor_previsto: valorCalculado })
+      .eq('id', parseInt(obra_id, 10));
+    if (updateObraError) {
+      console.warn('⚠️ Falha ao atualizar valor_previsto na obra:', updateObraError);
+    }
+
+    // 7. Responder com o orçamento atualizado
+    const { data: orcamentoAtualizado, error: fetchFinalError } = await supabase
+      .from('orcamentos')
+      .select('*')
+      .eq('id', orcId)
+      .single();
+    if (fetchFinalError) {
+      console.error('Erro ao buscar orçamento atualizado:', fetchFinalError);
+      return res.status(500).json({ error: 'Erro ao carregar orçamento atualizado' });
+    }
+    res.json(orcamentoAtualizado);
+  } catch (error) {
+    console.error('Erro ao atualizar orçamento:', error);
+    res.status(500).json({ error: 'Erro interno' });
+  }
+});
+
+// GET /orcamentos/:id/excel — Exportar orçamento como Excel profissional (versão visual aprimorada)
+app.get('/orcamentos/:id/excel', async (req, res) => {
+  const { id } = req.params;
+  const orcId = parseInt(id, 10);
+  if (isNaN(orcId)) {
+    return res.status(400).json({ error: 'ID de orçamento inválido' });
+  }
+
+  try {
+    // Buscar orçamento
+    const { data: orcamento, error: orcError } = await supabase
+      .from('orcamentos')
+      .select('id, obra_id, data_base, taxa_administracao, valor_total')
+      .eq('id', orcId)
+      .single();
+    if (orcError || !orcamento) {
+      return res.status(404).json({ error: 'Orçamento não encontrado' });
+    }
+
+    // Buscar obra com todos os dados do cabeçalho
+    let obra = { nome: '—', proprietario: '—', endereco: '—' };
+    if (orcamento.obra_id) {
+      const { data: obraData, error: obraError } = await supabase
+        .from('obras')
+        .select('nome, proprietario, endereco')
+        .eq('id', orcamento.obra_id)
+        .single();
+      if (!obraError && obraData) {
+        obra = obraData;
+      }
+    }
+
+    // Buscar itens
+    const { data: itens, error: itensError } = await supabase
+      .from('itens_orcamento')
+      .select('nivel, codigo, descricao, unidade, quantidade, valor_unitario_material, valor_unitario_mao_obra')
+      .eq('orcamento_id', orcId)
+      .order('ordem', { ascending: true });
+    if (itensError) {
+      return res.status(500).json({ error: 'Erro ao carregar itens' });
+    }
+
+        // Criar workbook
+    const ExcelJS = require('exceljs');
+    const workbook = new ExcelJS.Workbook();
+    const worksheet = workbook.addWorksheet('Orçamento', {
+      pageSetup: { paperSize: 9, orientation: 'landscape' }
+    });
+
+    // === Estilos ===
+    const headerStyle = {
+      font: { bold: true, color: { argb: 'FFFFFFFF' }, size: 11 },
+      fill: { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1E3A8A' } },
+      alignment: { horizontal: 'center', vertical: 'middle', wrapText: true },
+      border: { top: { style: 'thin' }, left: { style: 'thin' }, bottom: { style: 'thin' }, right: { style: 'thin' } }
+    };
+
+    const localStyle = {
+      font: { bold: true, color: { argb: 'FF1E40AF' }, size: 10 },
+      fill: { type: 'pattern', pattern: 'solid', fgColor: { argb: 'F0F9FF' } }
+    };
+
+    // ✅ Estilo para Etapa
+    const etapaStyle = {
+      font: { bold: true, color: { argb: 'FF4B5563' }, size: 10 },
+      fill: { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFD1D5DB' } } // cinza claro
+    };
+
+    // ✅ Estilo para Subetapa
+    const subetapaStyle = {
+      font: { bold: true, color: { argb: 'FF4B5563' }, size: 10 },
+      fill: { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFD1D5DB' } } // cinza um pouco mais escuro que etapa
+    };
+
+    const obraCellStyle = {
+      fill: { type: 'pattern', pattern: 'solid', fgColor: { argb: 'F8FAFC' } },
+      border: { top: { style: 'thin' }, left: { style: 'thin' }, bottom: { style: 'thin' }, right: { style: 'thin' } },
+      alignment: { vertical: 'middle' }
+    };
+
+    const numberStyle = {
+      numFmt: '#,##0.0000',
+      alignment: { horizontal: 'right' }
+    };
+
+    const decimalStyle = {
+      numFmt: '#,##0.00',
+      alignment: { horizontal: 'right' }
+    };
+
+    const borderStyle = {
+      border: { top: { style: 'thin' }, left: { style: 'thin' }, bottom: { style: 'thin' }, right: { style: 'thin' } }
+    };
+
+        // === Cabeçalho do documento (mesclado até coluna I, fundo laranja claro) ===
+    worksheet.mergeCells('A1:I1');
+    const titleCell = worksheet.getCell('A1');
+    titleCell.value = `ORÇAMENTO DE OBRA #${orcId}`;
+    titleCell.font = { bold: true, size: 16, color: { argb: 'FF1E3A8A' } };
+    titleCell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFF3E0' } }; // Laranja claro suave
+    titleCell.alignment = { horizontal: 'center', vertical: 'middle' };
+    titleCell.border = { top: { style: 'thin' }, left: { style: 'thin' }, bottom: { style: 'thin' }, right: { style: 'thin' } };
+    worksheet.getRow(1).height = 30;
+
+      // === Dados da obra (com borda EXTERNA apenas) ===
+    const startRow = 2;
+    const endRow = 6;
+    const obraRows = [
+      ['Obra:', obra.nome],
+      ['Cliente:', obra.proprietario],
+      ['Endereço:', obra.endereco],
+      ['Data Base:', orcamento.data_base ? new Date(orcamento.data_base).toLocaleDateString('pt-BR') : '—'],
+      ['Taxa de Administração:', `${orcamento.taxa_administracao || 0}%`]
+    ];
+
+    obraRows.forEach((row, idx) => {
+      const excelRow = worksheet.addRow(row);
+      excelRow.getCell(1).style = {
+        ...obraCellStyle,
+        font: { bold: true, size: 10 }
+      };
+      excelRow.getCell(2).style = obraCellStyle;
+    });
+
+    // Aplicar borda EXTERNA apenas (sem divisões internas)
+    for (let row = startRow; row <= endRow; row++) {
+      for (let col = 1; col <= 2; col++) {
+        const cell = worksheet.getCell(row, col);
+        if (row === startRow) cell.border.top = { style: 'thin' };
+        if (row === endRow) cell.border.bottom = { style: 'thin' };
+        if (col === 1) cell.border.left = { style: 'thin' };
+        if (col === 2) cell.border.right = { style: 'thin' };
+      }
+    }
+    worksheet.addRow([]); // linha em branco
+
+    // === Cabeçalho da tabela ===
+        const columns = [
+      'Cód.', 'Descrição', 'Und', 'Qtd',
+      'R$ Unit. Mat.', 'R$ Unit. Mão Obra',
+      'R$ Total Mat.', 'R$ Total Mão Obra',
+      'R$ Total'
+    ];
+    const headerRow = worksheet.addRow(columns);
+    headerRow.eachCell(cell => {
+      Object.assign(cell.style, headerStyle);
+    });
+    worksheet.getRow(worksheet.lastRow.number).height = 30;
+
+    // === Cálculo de totais ===
+    const servicos = itens.filter(i => i.nivel === 'servico');
+    const subtotal = servicos.reduce((sum, i) => {
+      const qtd = i.quantidade || 0;
+      const mat = i.valor_unitario_material || 0;
+      const mao = i.valor_unitario_mao_obra || 0;
+      return sum + qtd * (mat + mao);
+    }, 0);
+    const taxaValor = (subtotal * (orcamento.taxa_administracao || 0)) / 100;
+
+    // === Preencher itens ===
+    itens.forEach(item => {
+      const isServico = item.nivel === 'servico';
+      const qtd = item.quantidade || 0;
+      const matUnit = item.valor_unitario_material || 0;
+      const maoUnit = item.valor_unitario_mao_obra || 0;
+      const totalMat = qtd * matUnit;
+      const totalMao = qtd * maoUnit;
+      const total = totalMat + totalMao;
+
+      const rowValues = [
+        item.codigo || '',
+        item.descricao || '',
+        isServico ? (item.unidade || '') : '',
+        isServico ? qtd : '',
+        isServico ? matUnit : '',
+        isServico ? maoUnit : '',
+        isServico ? totalMat : '',
+        isServico ? totalMao : '',
+        isServico ? total : ''
+      ];
+
+      const row = worksheet.addRow(rowValues);
+      row.eachCell(cell => {
+        Object.assign(cell, borderStyle);
+      });
+
+      // ✅ Aplicar estilos por nível
+      if (item.nivel === 'local') {
+        row.eachCell(cell => {
+          Object.assign(cell.style, localStyle);
+        });
+      } else if (item.nivel === 'etapa') {
+        row.eachCell(cell => {
+          Object.assign(cell.style, etapaStyle);
+        });
+      } else if (item.nivel === 'subetapa') {
+        row.eachCell(cell => {
+          Object.assign(cell.style, subetapaStyle);
+        });
+      }
+
+      if (isServico) {
+        row.getCell(4).style = { ...row.getCell(4).style, ...decimalStyle, ...borderStyle };
+        [5, 6, 7, 8, 9].forEach(col => {
+          row.getCell(col).style = { ...row.getCell(col).style, ...decimalStyle, ...borderStyle };
+        });
+      }
+    });
+
+        // === Totais ===
+    worksheet.addRow([]);
+
+    // Subtotal
+    const subtotalRow = ['','','','','','','','Subtotal:', subtotal];
+    const subtotalExcelRow = worksheet.addRow(subtotalRow);
+    subtotalExcelRow.eachCell((cell, colNumber) => {
+      if (colNumber === 8) cell.font = { bold: true };
+      if (colNumber === 9) {
+        cell.numFmt = '#,##0.00';
+        cell.font = { bold: true };
+      }
+      cell.border = { top: { style: 'thin' }, left: { style: 'thin' }, bottom: { style: 'thin' }, right: { style: 'thin' } };
+    });
+
+    // Taxa de Administração
+    const taxaRow = ['','','','','','','','Taxa de Administração:', taxaValor];
+    const taxaExcelRow = worksheet.addRow(taxaRow);
+    taxaExcelRow.eachCell((cell, colNumber) => {
+      if (colNumber === 8) cell.font = { bold: true };
+      if (colNumber === 9) {
+        cell.numFmt = '#,##0.00';
+        cell.font = { bold: true };
+      }
+      cell.border = { top: { style: 'thin' }, left: { style: 'thin' }, bottom: { style: 'thin' }, right: { style: 'thin' } };
+    });
+
+    // TOTAL DO ORÇAMENTO
+    const totalRowData = ['','','','','','','','TOTAL DO ORÇAMENTO:', orcamento.valor_total];
+    const totalExcelRow = worksheet.addRow(totalRowData);
+    totalExcelRow.eachCell((cell, colNumber) => {
+      if (colNumber === 8 || colNumber === 9) {
+        cell.font = { bold: true, size: 12, color: { argb: 'FF1E3A8A' } };
+        cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'EFF6FF' } };
+      }
+      if (colNumber === 9) {
+        cell.numFmt = '#,##0.00';
+      }
+      cell.border = { top: { style: 'thin' }, left: { style: 'thin' }, bottom: { style: 'thin' }, right: { style: 'thin' } };
+    });
+
+    // === Ajustar largura das colunas ===
+    worksheet.getColumn(1).width = 10;  // Cód.
+    worksheet.getColumn(2).width = 40;  // Descrição
+    worksheet.getColumn(3).width = 8;   // Und
+    worksheet.getColumn(4).width = 10;  // Qtd
+    worksheet.getColumn(5).width = 14;  // Unit. Mat.
+    worksheet.getColumn(6).width = 16;  // Unit. Mão Obra
+    worksheet.getColumn(7).width = 14;  // Total Mat.
+    worksheet.getColumn(8).width = 16;  // Total Mão Obra
+    worksheet.getColumn(9).width = 16;  // Total
+
+    // === Gerar e enviar ===
+    const buffer = await workbook.xlsx.writeBuffer();
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', `attachment; filename=orcamento-${orcId}.xlsx`);
+    res.send(Buffer.from(buffer));
+  } catch (error) {
+    console.error('❌ Erro ao gerar Excel:', error);
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'Erro interno ao gerar arquivo Excel' });
+    }
+  }
+});
+
+// DELETE /orcamentos/:id — Excluir orçamento com validação de notas fiscais vinculadas
+app.delete('/orcamentos/:id', async (req, res) => {
+  const { id } = req.params;
+  const orcId = parseInt(id, 10);
+  if (isNaN(orcId)) {
+    return res.status(400).json({ error: 'ID de orçamento inválido' });
+  }
+
+  try {
+    // 🔒 1. Buscar IDs dos itens do orçamento
+    const { data: itensOrcamento, error: itensError } = await supabase
+      .from('itens_orcamento')
+      .select('id')
+      .eq('orcamento_id', orcId);
+
+    if (itensError) {
+      console.error('Erro ao buscar itens do orçamento:', itensError);
+      return res.status(500).json({ error: 'Erro ao verificar itens do orçamento' });
+    }
+
+    // Se não houver itens, não há vínculo possível
+    if (!itensOrcamento || itensOrcamento.length === 0) {
+      // Pular verificação de notas fiscais
+    } else {
+      // Extrair array de IDs
+      const itemIds = itensOrcamento.map(item => item.id);
+
+      // 🔒 2. Verificar se ALGUM desses itens está vinculado a nota fiscal
+      const { data: itensVinculados, error: vinculoError } = await supabase
+        .from('itens_nota_fiscal')
+        .select('id')
+        .in('orcamento_item_id', itemIds)
+        .limit(1);
+
+      if (vinculoError) {
+        console.error('Erro ao verificar vínculo com notas fiscais:', vinculoError);
+        return res.status(500).json({ error: 'Erro ao verificar dependências' });
+      }
+
+      if (itensVinculados && itensVinculados.length > 0) {
+        return res.status(403).json({
+          error: 'Não é possível excluir este orçamento porque há notas fiscais vinculadas a um ou mais de seus itens.'
+        });
+      }
+    }
+
+    // 🧹 3. Excluir itens do orçamento
+    const { error: deleteItensError } = await supabase
+      .from('itens_orcamento')
+      .delete()
+      .eq('orcamento_id', orcId);
+
+    if (deleteItensError) {
+      console.error('Erro ao excluir itens do orçamento:', deleteItensError);
+      return res.status(500).json({ error: 'Erro ao excluir itens do orçamento' });
+    }
+
+    // 🗑️ 4. Excluir orçamento principal
+    const { error: deleteOrcError } = await supabase
+      .from('orcamentos')
+      .delete()
+      .eq('id', orcId);
+
+    if (deleteOrcError) {
+      console.error('Erro ao excluir orçamento:', deleteOrcError);
+      return res.status(500).json({ error: 'Erro ao excluir orçamento' });
+    }
+
+    // ✅ Sucesso
+    res.status(204).send(); // No Content
+  } catch (error) {
+    console.error('Erro ao excluir orçamento:', error);
+    res.status(500).json({ error: 'Erro interno ao excluir orçamento' });
+  }
+});
+
+// GET /obras/:id/servicos-orcamento — Busca serviços (nível 'servico') dos orçamentos da obra
+app.get('/obras/:id/servicos-orcamento', async (req, res) => {
+  const { id } = req.params;
+  const obraId = parseInt(id, 10);
+  if (isNaN(obraId)) {
+    return res.status(400).json({ error: 'ID da obra inválido' });
+  }
+  try {
+    // Buscar IDs dos orçamentos da obra
+    const { data: orcamentos, error: orcError } = await supabase
+      .from('orcamentos')
+      .select('id')
+      .eq('obra_id', obraId);
+    if (orcError) throw orcError;
+    if (!orcamentos || orcamentos.length === 0) {
+      return res.json([]);
+    }
+    const orcamentoIds = orcamentos.map(o => o.id);
+    // Buscar itens de nível 'servico'
+    const { data: servicos, error: servError } = await supabase
+      .from('itens_orcamento')
+      .select('id, codigo, descricao, orcamento_id')
+      .in('orcamento_id', orcamentoIds)
+      .eq('nivel', 'servico')
+      .order('codigo', { ascending: true });
+    if (servError) throw servError;
+    res.json(servicos || []);
+  } catch (error) {
+    console.error('Erro ao buscar serviços do orçamento:', error);
+    res.status(500).json({ error: 'Erro ao buscar serviços' });
+  }
+});
+
+// GET /notas-fiscais — versão corrigida e única
+app.get('/notas-fiscais', async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('notas_fiscais')
+      .select(`
+        id,
+        numero_nota,
+        data_emissao,
+        data_vencimento,
+        data_lancamento,
+        data_pagamento,
+        forma_pagamento,
+        valor_total,
+        valor_pago,
+        status,
+        obra_id,
+        fornecedor_id,
+        obras (nome),
+        fornecedores (nome_fantasia),
+        usuario_lancamento
+      `)
+      .order('data_emissao', { ascending: false });
+
+    if (error) {
+      console.error('Erro ao buscar notas fiscais:', error);
+      return res.status(500).json({ error: 'Erro ao carregar notas fiscais' });
+    }
+
+    // Garantir que obras e fornecedores existam (evitar undefined)
+    const notasSeguras = data.map(nota => ({
+      ...nota,
+      obras: nota.obras || { nome: '—' },
+      fornecedores: nota.fornecedores || { nome_fantasia: '—' }
+    }));
+// Aplica a formatação a cada item da lista
+    const dadosFormatados = data.map(nota => ({
+      ...nota,
+      data_pagamento: formatarDataParaLocal(nota.data_pagamento),
+      // data_emissao: formatarDataParaLocal(nota.data_emissao), // Opcional
+      // data_vencimento: formatarDataParaLocal(nota.data_vencimento), // Opcional
+    }));
+    res.json(notasSeguras);
+  } catch (error) {
+    console.error('Erro inesperado em /notas-fiscais:', error);
+    res.status(500).json({ error: 'Erro interno' });
+  }
+});
+
+// Função para converter uma data (ISO string ou Date object) para YYYY-MM-DD no fuso local
+// Esta função garante que a data seja uma string no formato correto, evitando desvios de fuso.
+const formatarDataParaLocal = (dataISO) => {
+  if (!dataISO) return null;
+  // Se for string e estiver no formato YYYY-MM-DD, retorne como está
+  if (typeof dataISO === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(dataISO)) {
+    return dataISO;
+  }
+  // Se for uma string de timestamp (com T e horário) ou um objeto Date, converta
+  const date = new Date(dataISO);
+  if (isNaN(date.getTime())) return null; // Invalid date
+  // Formata como YYYY-MM-DD no fuso local do servidor (não UTC)
+  // Usar getFullYear, getMonth, getDate evita conversões de fuso para o dia/mês/ano
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, '0'); // Months are 0-indexed
+  const day = String(date.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+};
+
+// GET /notas-fiscais/excel — Exportar lista completa de notas fiscais para Excel
+app.get('/notas-fiscais/excel', async (req, res) => {
+  try {
+    // 1. Buscar notas fiscais com filtros (igual ao PDF)
+    let query = supabase
+      .from('notas_fiscais')
+      .select(`
+        numero_nota,
+        data_emissao,
+        data_vencimento,
+        data_pagamento,
+        forma_pagamento,
+        frete,
+        valor_total,
+        valor_pago,
+        status,
+        obra_id,
+        fornecedor_id,
+        usuario_baixa,
+        usuario_lancamento,
+        obras (nome),
+        fornecedores (nome_fantasia)
+      `)
+      .order('data_emissao', { ascending: false });
+
+    if (req.query.obra_id) {
+      query = query.eq('obra_id', req.query.obra_id);
+    }
+
+    const { data: notas, error } = await query;
+    if (error) throw error;
+
+    const listaNotas = Array.isArray(notas) ? notas : [];
+
+    // 2. Buscar obras e fornecedores em lote (se ainda não estiverem no .select com !inner)
+    const obraIds = [...new Set(listaNotas.map(n => n.obra_id))];
+    const fornecedorIds = [...new Set(listaNotas.map(n => n.fornecedor_id))];
+
+    const [obrasRes, fornecedoresRes] = await Promise.all([
+      supabase.from('obras').select('id, nome').in('id', obraIds),
+      supabase.from('fornecedores').select('id, nome_fantasia').in('id', fornecedorIds)
+    ]);
+
+    const obrasMap = (obrasRes.data || []).reduce((acc, o) => ({ ...acc, [o.id]: o.nome }), {});
+    const fornecedoresMap = (fornecedoresRes.data || []).reduce((acc, f) => ({ ...acc, [f.id]: f.nome_fantasia }), {});
+
+    // 3. Criar workbook Excel
+    const ExcelJS = require('exceljs');
+    const workbook = new ExcelJS.Workbook();
+    const worksheet = workbook.addWorksheet('Notas Fiscais');
+
+    // 4. Estilos
+    const headerStyle = {
+      font: { bold: true, color: { argb: 'FFFFFFFF' }, size: 11 },
+      fill: { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1E3A8A' } },
+      alignment: { horizontal: 'center', vertical: 'middle', wrapText: true },
+      border: { top: { style: 'thin' }, left: { style: 'thin' }, bottom: { style: 'thin' }, right: { style: 'thin' } }
+    };
+
+    const borderStyle = {
+      border: { top: { style: 'thin' }, left: { style: 'thin' }, bottom: { style: 'thin' }, right: { style: 'thin' } }
+    };
+
+    const moneyStyle = {
+      numFmt: 'R$ #,##0.00',
+      alignment: { horizontal: 'right' }
+    };
+
+    // 5. Cabeçalho
+    const columns = [
+      'NF',
+      'Obra',
+      'Fornecedor',
+      'Lançamento',
+      'Emissão',
+      'Vencimento',
+      'Valor Total',
+      'Valor Pago',
+      'Status',
+      'Usuário Lançamento',
+      'Usuário Baixa'
+    ];
+
+    const headerRow = worksheet.addRow(columns);
+    headerRow.eachCell(cell => {
+      Object.assign(cell.style, headerStyle);
+    });
+
+    // 6. Preencher dados
+    listaNotas.forEach(nota => {
+      const row = worksheet.addRow([
+        nota.numero_nota || '—',
+        obrasMap[nota.obra_id] || '—',
+        fornecedoresMap[nota.fornecedor_id] || '—',
+        nota.data_lancamento ? new Date(nota.data_lancamento).toLocaleDateString('pt-BR') : '—',
+        nota.data_emissao ? new Date(nota.data_emissao).toLocaleDateString('pt-BR') : '—',
+        nota.data_vencimento ? new Date(nota.data_vencimento).toLocaleDateString('pt-BR') : '—',
+        nota.valor_total || 0,
+        nota.valor_pago || nota.valor_total || 0,
+        nota.status || '—',
+        nota.usuario_lancamento || '—',
+        nota.usuario_baixa || '—'
+      ]);
+
+      row.eachCell((cell, colNumber) => {
+        Object.assign(cell.style, borderStyle);
+        // Aplicar estilo monetário nas colunas de valores (7 e 8)
+        if (colNumber === 7 || colNumber === 8) {
+          Object.assign(cell.style, moneyStyle);
+        }
+      });
+    });
+
+    // 7. Ajustar largura das colunas
+    worksheet.getColumn(1).width = 12;  // NF
+    worksheet.getColumn(2).width = 25;  // Obra
+    worksheet.getColumn(3).width = 25;  // Fornecedor
+    worksheet.getColumn(4).width = 12;  // Lançamento
+    worksheet.getColumn(5).width = 12;  // Emissão
+    worksheet.getColumn(6).width = 12;  // Vencimento
+    worksheet.getColumn(7).width = 14;  // Valor Total
+    worksheet.getColumn(8).width = 14;  // Valor Pago
+    worksheet.getColumn(9).width = 12;  // Status
+    worksheet.getColumn(10).width = 20; // Usuário Lançamento
+    worksheet.getColumn(11).width = 20; // Usuário Baixa
+
+    // 8. Gerar e enviar arquivo
+    const buffer = await workbook.xlsx.writeBuffer();
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', `attachment; filename=notas-fiscais.xlsx`);
+    res.send(Buffer.from(buffer));
+
+  } catch (error) {
+    console.error('❌ Erro ao gerar Excel de notas fiscais:', error);
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'Erro interno ao gerar arquivo Excel' });
+    }
+  }
+});
+
+// GET /notas-fiscais/:id
+app.get('/notas-fiscais/:id', async (req, res) => {
+  const { id } = req.params;
+  const notaId = parseInt(id, 10);
+  if (isNaN(notaId)) {
+    return res.status(400).json({ error: 'ID da nota fiscal inválido' });
+  }
+  try {
+    // 1. Buscar a nota fiscal COM os dados do fornecedor e da obra
+    const { data: nota, error: notaError } = await supabase
+      .from('notas_fiscais')
+      .select(`
+        *,
+        fornecedores!inner(nome_fantasia),
+        obras!inner(nome)
+      `)
+      .eq('id', notaId)
+      .single();
+    if (notaError || !nota) {
+      console.error('Nota fiscal não encontrada:', notaError);
+      return res.status(404).json({ error: 'Nota fiscal não encontrada' });
+    }
+    // 2. Buscar os itens da nota fiscal
+    const { data: itens, error: itensError } = await supabase
+      .from('itens_nota_fiscal')
+      .select('*')
+      .eq('nota_fiscal_id', notaId)
+      .order('id', { ascending: true });
+    if (itensError) {
+      console.error('Erro ao buscar itens da nota fiscal:', itensError);
+      // Não falha — retorna nota com itens vazios
+    }
+
+    // 3. ✅ CORREÇÃO CRÍTICA: Formatar datas como strings YYYY-MM-DD para evitar fuso
+    // A Supabase pode retornar datas como timestamps (com horário) ou como strings 'YYYY-MM-DD'.
+    // Se forem timestamps, o navegador pode interpretá-los incorretamente.
+    // Esta função garante que sejam strings 'YYYY-MM-DD'.
+    const formatarDataParaLocal = (dataISO) => {
+      if (!dataISO) return null;
+      // Se já estiver no formato YYYY-MM-DD (string), retorne como está
+      if (typeof dataISO === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(dataISO)) {
+        return dataISO;
+      }
+      // Se for um timestamp (string com 'T') ou objeto Date, converta
+      const date = new Date(dataISO);
+      if (isNaN(date.getTime())) return null; // Invalid date
+      // Usar getFullYear, getMonth, getDate evita conversão de fuso para o dia/mês/ano
+      const ano = date.getFullYear();
+      const mes = String(date.getMonth() + 1).padStart(2, '0'); // Janeiro é 0
+      const dia = String(date.getDate()).padStart(2, '0');
+      return `${ano}-${mes}-${dia}`;
+    };
+
+    // Aplica a formatação às datas relevantes ANTES de montar a resposta final
+    const notaFormatada = {
+      ...nota,
+      data_emissao: formatarDataParaLocal(nota.data_emissao),
+      data_vencimento: formatarDataParaLocal(nota.data_vencimento),
+      data_pagamento: formatarDataParaLocal(nota.data_pagamento), // ✅ Aplica aqui
+      data_lancamento: formatarDataParaLocal(nota.data_lancamento), // Opcional
+    };
+
+    // 4. Montar resposta com itens
+    const notaCompleta = {
+      ...notaFormatada, // ✅ Usa a nota com datas formatadas e dados relacionados
+      itens: itens || []
+    };
+    res.json(notaCompleta);
+  } catch (error) {
+    console.error('Erro ao buscar nota fiscal:', error);
+    res.status(500).json({ error: 'Erro interno ao buscar nota fiscal' });
+  }
+});
+
+// GET /obras/:id/valor-realizado
+app.get('/obras/:id/valor-realizado', async (req, res) => {
+  const { id } = req.params;
+  const obraId = parseInt(id, 10);
+
+  if (isNaN(obraId)) {
+    return res.status(400).json({ error: 'ID de obra inválido' });
+  }
+
+  try {
+    // Soma o valor_total de TODAS as notas PAGAS dessa obra
+    const { data, error } = await supabase
+      .from('notas_fiscais')
+      .select('valor_total')
+      .eq('obra_id', obraId)
+      .eq('status', 'pago'); // ← SÓ NOTAS PAGAS
+
+    if (error) {
+      console.error('Erro ao buscar valor realizado:', error);
+      return res.status(500).json({ error: 'Erro interno' });
+    }
+
+    const valorRealizado = data.reduce((sum, nota) => sum + (nota.valor_total || 0), 0);
+    res.json({ valor_realizado: valorRealizado });
+  } catch (error) {
+    console.error('Erro inesperado:', error);
+    res.status(500).json({ error: 'Erro interno' });
+  }
+});
+
+// Função para sanitizar nome de arquivo (fora da rota, mas pode estar dentro)
+const sanitizeFileName = (name) => {
+  return name
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-zA-Z0-9._-]/g, '_')
+    .replace(/_{2,}/g, '_')
+    .replace(/^_+|_+$/g, '');
+};
+
+// POST /notas-fiscais — com upload de anexos
+app.post('/notas-fiscais', upload.fields([
+  { name: 'anexo_nota_fiscal', maxCount: 1 },
+  { name: 'anexo_boleto', maxCount: 1 }
+]), async (req, res) => {
+  const {
+    obra_id,
+    fornecedor_id, 
+    numero_nota, 
+    data_emissao, 
+    data_vencimento,
+    data_pagamento,
+    forma_pagamento,
+    frete = 0,
+    itens = '[]',
+    usuario_lancamento
+  } = req.body;
+
+  if (!obra_id || !fornecedor_id || !numero_nota || !data_emissao || !data_vencimento) {
+    return res.status(400).json({ error: 'Campos obrigatórios ausentes' });
+  }
+
+  try {
+    // Parse seguro de itens
+    let itensArray = [];
+    if (typeof itens === 'string') {
+      try {
+        itensArray = JSON.parse(itens);
+      } catch (e) {
+        console.error('❌ JSON inválido em itens:', itens);
+        return res.status(400).json({ error: 'Formato inválido para itens' });
+      }
+    } else if (Array.isArray(itens)) {
+      itensArray = itens;
+    } else {  
+      return res.status(400).json({ error: 'Campo "itens" deve ser um array ou JSON válido' });
+    }
+
+    const itensSemApropriacao = itensArray.filter(item => !item.orcamento_item_id);
+    if (itensSemApropriacao.length > 0) {
+      return res.status(400).json({ error: 'Todos os itens devem estar vinculados a um serviço do orçamento' });
+    }
+
+    const valorItens = itensArray.reduce((sum, item) => sum + (item.preco_total || 0), 0);
+    const valorTotal = valorItens + (parseFloat(frete) || 0);
+
+    // ✅ Upload de anexos
+    let caminhoNF = null;
+    let caminhoBoleto = null;
+
+    if (req.files?.['anexo_nota_fiscal']?.[0]) {
+      const file = req.files['anexo_nota_fiscal'][0];
+      const safeName = sanitizeFileName(file.originalname);
+      const fileName = `nf-${Date.now()}-${safeName}`;
+      const filePath = `notas-fiscais/${numero_nota}/${fileName}`;
+      const { error: uploadError } = await supabase.storage
+        .from('documentos-fiscais')
+        .upload(filePath, file.buffer, {
+          contentType: file.mimetype,
+          upsert: false
+        });
+      if (uploadError) throw uploadError;
+      caminhoNF = filePath;
+    }
+
+    if (req.files?.['anexo_boleto']?.[0]) {
+      const file = req.files['anexo_boleto'][0];
+      const safeName = sanitizeFileName(file.originalname);
+      const fileName = `boleto-${Date.now()}-${safeName}`;
+      const filePath = `notas-fiscais/${numero_nota}/${fileName}`;
+      const { error: uploadError } = await supabase.storage
+        .from('documentos-fiscais')
+        .upload(filePath, file.buffer, {
+          contentType: file.mimetype,
+          upsert: false
+        });
+      if (uploadError) throw uploadError;
+      caminhoBoleto = filePath;
+    }
+
+        // ✅ Recuperar o usuário autenticado (obrigatório)
+    const userId = req.headers['x-user-id'];
+    if (!userId) {
+      return res.status(401).json({ error: 'Usuário não autenticado' });
+    }
+    const { data: usuario, error: userError } = await supabase
+      .from('usuarios')
+      .select('name')
+      .eq('id', parseInt(userId, 10))
+      .single();
+    if (userError || !usuario) {
+      return res.status(401).json({ error: 'Usuário inválido' });
+    }
+
+    // Inserir nota fiscal com caminhos dos anexos
+    const { data: notaData, error: notaError } = await supabase
+      .from('notas_fiscais')
+      .insert([{
+        obra_id: parseInt(obra_id),
+        fornecedor_id: parseInt(fornecedor_id),
+        numero_nota,
+        data_emissao,
+        data_vencimento,
+        forma_pagamento: forma_pagamento || null,
+        data_lancamento: new Date().toISOString().split('T')[0],
+        data_pagamento: data_pagamento || null,
+        frete: parseFloat(frete) || 0,
+        valor_total: parseFloat(valorTotal),
+        status: 'lançada',
+        anexo_nota_fiscal: caminhoNF,
+        anexo_boleto: caminhoBoleto,
+        usuario_lancamento: usuario.name // ← SEMPRE o nome do usuário autenticado
+      }])
+      .select()
+      .single();
+    if (notaError) throw notaError;
+
+    // Inserir itens
+    const itensParaInserir = itensArray.map(item => ({
+      nota_fiscal_id: notaData.id,
+      descricao: item.descricao,
+      unidade: item.unidade || null,
+      quantidade: parseFloat(item.quantidade) || 0,
+      preco_unit: parseFloat(item.preco_unit) || 0,
+      imposto: parseFloat(item.imposto) || 0,
+      preco_total: parseFloat(item.preco_total) || 0,
+      orcamento_item_id: parseInt(item.orcamento_item_id)
+    }));
+    const { error: itensError } = await supabase
+      .from('itens_nota_fiscal')
+      .insert(itensParaInserir);
+    if (itensError) throw itensError;
+
+    res.status(201).json(notaData);
+  } catch (error) {
+    console.error('Erro ao criar nota fiscal:', error);
+    res.status(500).json({ error: 'Erro ao criar nota fiscal' });
+  }
+});
+
+// POST /notas-fiscais/:id/baixa — Registrar pagamento e atualizar valor_realizado da obra
+app.post('/notas-fiscais/:id/baixa', async (req, res) => {
+  const { id } = req.params;
+  const notaId = parseInt(id, 10);
+  const { 
+    data_pagamento, 
+    juros = 0, 
+    desconto = 0, 
+    observacoes = '', 
+    usuario_baixa 
+  } = req.body;
+
+  if (isNaN(notaId) || !data_pagamento || !usuario_baixa) {
+    return res.status(400).json({ error: 'ID da nota, data de pagamento e usuário da baixa são obrigatórios' });
+  }
+
+  try {
+    // 1. Buscar a nota fiscal para obter valor_total e obra_id
+    const { data: nota, error: notaError } = await supabase
+      .from('notas_fiscais')
+      .select('id, valor_total, obra_id')
+      .eq('id', notaId)
+      .single();
+
+    if (notaError || !nota) {
+      console.error('❌ Nota não encontrada:', notaError);
+      return res.status(404).json({ error: 'Nota fiscal não encontrada' });
+    }
+
+    const valorOriginal = parseFloat(nota.valor_total) || 0;
+    const jurosNum = parseFloat(juros) || 0;
+    const descontoNum = parseFloat(desconto) || 0;
+    const valorPago = valorOriginal + jurosNum - descontoNum;
+
+    if (valorPago <= 0) {
+      return res.status(400).json({ error: 'Valor pago deve ser maior que zero' });
+    }
+
+    // 2. Atualizar a nota fiscal com valor_pago e status = 'pago'
+    const { error: updateNotaError } = await supabase
+      .from('notas_fiscais')
+      .update({
+        data_pagamento: data_pagamento,
+        juros: jurosNum,
+        desconto: descontoNum,
+        valor_pago: valorPago,
+        status: 'pago',
+        usuario_baixa: usuario_baixa,
+        observacoes: observacoes
+      })
+      .eq('id', notaId);
+
+    if (updateNotaError) {
+      console.error('❌ Erro ao atualizar nota fiscal:', updateNotaError);
+      return res.status(500).json({ error: 'Erro ao registrar pagamento' });
+    }
+
+    // 3. 🔁 Atualizar valor_realizado da OBRA com segurança
+    const { data: notasPagas, error: notasError } = await supabase
+      .from('notas_fiscais')
+      .select('valor_pago')
+      .eq('obra_id', nota.obra_id)
+      .eq('status', 'pago');
+
+    if (notasError) {
+      console.warn('⚠️ Erro ao buscar notas pagas:', notasError);
+    } else {
+      const listaNotas = Array.isArray(notasPagas) ? notasPagas : [];
+      const novoValorRealizado = listaNotas
+        .reduce((sum, n) => sum + (parseFloat(n.valor_pago) || 0), 0);
+
+      const { error: updateObraError } = await supabase
+        .from('obras')
+        .update({ valor_realizado: novoValorRealizado })
+        .eq('id', nota.obra_id);
+
+      if (updateObraError) {
+        console.warn('⚠️ Erro ao atualizar valor_realizado da obra:', updateObraError);
+      } else {
+        console.log(`✅ Obra ${nota.obra_id} atualizada com valor_realizado = R$ ${novoValorRealizado.toFixed(2)}`);
+      }
+    }
+
+    res.status(201).json({ 
+      success: true, 
+      nota_fiscal_id: notaId,
+      valor_pago: valorPago 
+    });
+
+  } catch (error) {
+    console.error('💥 Erro interno na baixa:', error);
+    res.status(500).json({ error: 'Erro interno ao registrar pagamento' });
+  }
+});
+
+/// POST /notas-fiscais/:id/cancelar-baixa
+app.post('/notas-fiscais/:id/cancelar-baixa', async (req, res) => {
+  const { id } = req.params;
+  const notaId = parseInt(id, 10);
+  if (isNaN(notaId)) {
+    return res.status(400).json({ error: 'ID inválido' });
+  }
+
+  try {
+    // 1. Buscar a nota fiscal para obter obra_id e valor_total
+    const { data: nota, error: fetchError } = await supabase
+      .from('notas_fiscais')
+      .select('id, status, obra_id, valor_total')
+      .eq('id', notaId)
+      .single();
+
+    if (fetchError || !nota) {
+      return res.status(404).json({ error: 'Nota fiscal não encontrada' });
+    }
+
+    if (nota.status !== 'pago') {
+      return res.status(400).json({ error: 'A nota não está paga.' });
+    }
+
+    // 2. Atualizar a nota fiscal para 'pendente'
+    const { error: updateNotaError } = await supabase
+      .from('notas_fiscais')
+      .update({
+        status: 'pendente',
+        data_pagamento: null,
+        juros: 0,
+        valor_pago: null,   // ← limpa o valor pago
+        usuario_baixa: null,
+        })
+      .eq('id', notaId);
+
+    if (updateNotaError) {
+      console.error('Erro ao cancelar baixa da nota:', updateNotaError);
+      return res.status(500).json({ error: 'Erro ao cancelar baixa' });
+    }
+
+    // 3. 🔁 Atualizar valor_realizado da OBRA
+    const { data: notasPagas, error: notasError } = await supabase
+      .from('notas_fiscais')
+      .select('valor_pago')
+      .eq('obra_id', nota.obra_id) // ✅ usa nota.obra_id
+      .eq('status', 'pago');
+
+    if (notasError) {
+      console.warn('Erro ao buscar notas pagas:', notasError);
+    } else {
+      const novoValorRealizado = notasPagas
+        .reduce((sum, n) => sum + (parseFloat(n.valor_pago) || 0), 0);
+
+      const { error: updateObraError } = await supabase
+        .from('obras')
+        .update({ valor_realizado: novoValorRealizado })
+        .eq('id', nota.obra_id); // ✅ usa nota.obra_id
+
+      if (updateObraError) {
+        console.warn('Erro ao atualizar valor_realizado da obra:', updateObraError);
+      } else {
+        console.log(`✅ Obra ${nota.obra_id} atualizada após cancelamento de baixa`);
+      }
+    }
+
+    res.json({ success: true, message: 'Baixa cancelada com sucesso.' });
+
+  } catch (error) {
+    console.error('Erro interno ao cancelar baixa:', error);
+    res.status(500).json({ error: 'Erro interno' });
+  }
+});
+// DELETE /notas-fiscais/:id
+app.delete('/notas-fiscais/:id', async (req, res) => {
+  const { id } = req.params;
+  const notaId = parseInt(id, 10);
+
+  try {
+    // Verificar status antes de deletar
+    const { data: nota, error: fetchError } = await supabase
+      .from('notas_fiscais')
+      .select('status')
+      .eq('id', notaId)
+      .single();
+
+    if (fetchError || !nota) {
+      return res.status(404).json({ error: 'Nota não encontrada' });
+    }
+
+    if (nota.status === 'pago') {
+      return res.status(403).json({ error: 'Não é permitido excluir notas pagas. Primeiro cancele a baixa.' });
+    }
+
+    const { error } = await supabase
+      .from('notas_fiscais')
+      .delete()
+      .eq('id', notaId);
+
+    if (error) throw error;
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Erro ao excluir nota:', error);
+    res.status(500).json({ error: 'Erro interno' });
+  }
+});
+
+// PUT /notas-fiscais/:id
+app.put('/notas-fiscais/:id', async (req, res) => {
+  const { id } = req.params;
+  const notaId = parseInt(id, 10);
+  if (isNaN(notaId)) return res.status(400).json({ error: 'ID inválido' });
+  const {
+    obra_id,
+    fornecedor_id,
+    numero_nota,
+    data_emissao,
+    data_vencimento,
+    data_pagamento,
+    forma_pagamento, // Pode ser vazio
+    frete,
+    valor_total,
+    status
+    // data_lancamento NÃO deve ser desestruturado aqui para atualização
+  } = req.body;
+
+  try {
+    // Criar objeto de atualização dinamicamente
+    const updateObject = {
+      obra_id: parseInt(obra_id),
+      fornecedor_id: parseInt(fornecedor_id),
+      numero_nota,
+      data_emissao,
+      data_vencimento,
+      data_pagamento: data_pagamento || null,
+      frete: parseFloat(frete) || 0,
+      valor_total: parseFloat(valor_total),
+      status
+    };
+
+    // ✅ Só adiciona forma_pagamento ao objeto se for um valor válido (não vazio)
+    if (forma_pagamento && forma_pagamento.trim() !== '') {
+        updateObject.forma_pagamento = forma_pagamento;
+    } else {
+        // Se o valor recebido for vazio, não atualiza o campo no banco
+        console.log(`⚠️ forma_pagamento vazio recebido. Mantendo valor original no banco para nota ID ${notaId}.`);
+    }
+
+    // ✅ NUNCA atualiza data_lancamento ou usuario_baixa via edição
+    // Eles são fixos no momento do lançamento ou baixa.
+
+    const { error } = await supabase
+      .from('notas_fiscais')
+      .update(updateObject) // <- Usando o objeto dinâmico
+      .eq('id', notaId);
+    if (error) throw error;
+    res.json({ id: notaId });
+  } catch (error) {
+    console.error('Erro ao atualizar nota fiscal:', error);
+    res.status(500).json({ error: 'Erro ao atualizar nota' });
+  }
+});
+
+// PDF: GET /notas-fiscais/:id/pdf
+app.get('/notas-fiscais/:id/pdf', async (req, res) => {
+  const { id } = req.params;
+  const notaId = parseInt(id, 10);
+  if (isNaN(notaId)) return res.status(400).json({ error: 'ID inválido' });
+  try {
+    const { data: nota, error } = await supabase
+      .from('notas_fiscais')
+      .select(`
+        *,
+        obras (nome),
+        fornecedores (nome_fantasia, cnpj)
+      `)
+      .eq('id', notaId)
+      .single();
+    if (error || !nota) return res.status(404).json({ error: 'Nota não encontrada' });
+
+    const { data: itens, error: itensError } = await supabase
+      .from('itens_nota_fiscal')
+      .select('*')
+      .eq('nota_fiscal_id', notaId);
+    if (itensError) throw itensError;
+
+    const html = `
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <meta charset="utf-8">
+        <title>Nota Fiscal ${nota.numero_nota}</title>
+        <style>
+          body { font-family: Arial, sans-serif; margin: 40px; }
+          h1 { color: #1e3a8a; text-align: center; }
+          .header { text-align: right; margin-bottom: 30px; }
+          table { width: 100%; border-collapse: collapse; margin-top: 15px; }
+          th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+          th { background-color: #f1f5f9; }
+          .section { margin: 20px 0 10px; font-weight: bold; }
+        </style>
+      </head>
+      <body>
+        <h1>NOTA FISCAL</h1>
+        <div class="header">NF: ${nota.numero_nota}</div>
+        <div class="section">DADOS DA OBRA</div>
+        <p><strong>Obra:</strong> ${nota.obras?.nome || '—'}</p>
+        <div class="section">FORNECEDOR</div>
+        <p><strong>Nome:</strong> ${nota.fornecedores?.nome_fantasia || '—'}<br>
+           <strong>CNPJ:</strong> ${nota.fornecedores?.cnpj || '—'}</p>
+        <div class="section">ITENS</div>
+        <table>
+          <thead>
+            <tr>
+              <th>Descrição</th>
+              <th>Und</th>
+              <th>Qtd</th>
+              <th>Vlr Unit.</th>
+              <th>Impostos</th>
+              <th>Total</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${itens.map(item => `
+              <tr>
+                <td>${item.descricao || '—'}</td>
+                <td>${item.unidade || '—'}</td>
+                <td>${item.quantidade || '—'}</td>
+                <td>R$ ${parseFloat(item.preco_unit).toFixed(2).replace('.', ',')}</td>
+                <td>R$ ${parseFloat(item.imposto).toFixed(2).replace('.', ',')}</td>
+                <td>R$ ${parseFloat(item.preco_total).toFixed(2).replace('.', ',')}</td>
+              </tr>
+            `).join('')}
+          </tbody>
+        </table>
+        <p style="margin-top: 20px;"><strong>Frete:</strong> R$ ${(parseFloat(nota.frete) || 0).toFixed(2).replace('.', ',')}</p>
+        <p><strong>Valor Total:</strong> R$ ${(parseFloat(nota.valor_total) || 0).toFixed(2).replace('.', ',')}</p>
+      </body>
+      </html>
+    `;
+    pdf.create(html).toBuffer((err, buffer) => {
+      if (err) return res.status(500).json({ error: 'Erro ao gerar PDF' });
+      res.setHeader('Content-Type', 'application/pdf');
+      res.setHeader('Content-Disposition', `inline; filename=nota-${nota.numero_nota}.pdf`);
+      res.send(buffer);
+    });
+  } catch (error) {
+    console.error('Erro ao gerar PDF da nota:', error);
+    res.status(500).json({ error: 'Erro interno' });
+  }
+});
+
+// PDF: GET /notas-fiscais/pdf/lista — Exportar LISTA COMPLETA de notas fiscais (com logo)
+app.get('/notas-fiscais/pdf/lista', async (req, res) => {
+  try {
+    let query = supabase
+      .from('notas_fiscais')
+      .select(`
+        numero_nota,
+        data_emissao,
+        data_pagamento,
+        forma_pagamento,
+        frete,
+        valor_total,
+        status,
+        obra_id,
+        fornecedor_id,
+        usuario_baixa,
+        usuario_lancamento  
+      `)
+      .order('data_emissao', { ascending: false });
+
+    if (req.query.obra_id) {
+      query = query.eq('obra_id', req.query.obra_id);
+    }
+
+    const { data: notas, error } = await query; 
+    if (error) throw error;
+
+    // Garantir que `notas` seja um array
+    const listaNotas = Array.isArray(notas) ? notas : [];
+
+    // Buscar obras e fornecedores em lote
+    const obraIds = [...new Set(listaNotas.map(n => n.obra_id))];
+    const fornecedorIds = [...new Set(listaNotas.map(n => n.fornecedor_id))];
+
+    const [obrasRes, fornecedoresRes] = await Promise.all([
+      supabase.from('obras').select('id, nome').in('id', obraIds),
+      supabase.from('fornecedores').select('id, nome_fantasia').in('id', fornecedorIds)
+    ]);
+
+    const obrasMap = (obrasRes.data || []).reduce((acc, o) => ({ ...acc, [o.id]: o.nome }), {});
+    const fornecedoresMap = (fornecedoresRes.data || []).reduce((acc, f) => ({ ...acc, [f.id]: f.nome_fantasia }), {});
+
+    let tituloObra = 'Todas as Obras';
+    if (req.query.obra_id) {
+      const obraNome = obrasMap[req.query.obra_id];
+      if (obraNome) tituloObra = obraNome;
+    }
+
+    // === 🔑 COLE AQUI O SEU LOGO EM BASE64 ===
+    const LOGO_BASE64 = 'data:image/png;base64,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'
+
+    const html = `
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <meta charset="utf-8">
+        <title>Lista de Notas Fiscais - ${tituloObra}</title>
+        <style>
+          body { font-family: Arial, sans-serif; margin: 30px; font-size: 9pt; }
+          .header-container { 
+            display: flex; 
+            align-items: center; 
+            gap: 15px; 
+            margin-bottom: 20px; 
+            padding-bottom: 15px; 
+            border-bottom: 2px solid #1e3a8a; 
+          }
+          .header-logo { height: 40px; }
+          h1 { 
+            color: #1e3a8a; 
+            margin: 0; 
+            font-size: 18pt; 
+          }
+          table { width: 100%; border-collapse: collapse; margin-top: 15px; }
+          th, td { border: 1px solid #999; padding: 6px; text-align: left; }
+          th { background-color: #f1f5f9; font-weight: bold; text-align: center; }
+        </style>
+      </head>
+      <body>
+        <div class="header-container">
+          <img src="${LOGO_BASE64}" alt="Logo da Empresa" class="header-logo">
+          <div>
+            <h1>ERP MINHAS OBRAS</h1>
+            <p style="margin: 4px 0; font-size: 10pt; color: #4b5563;">Lista de Notas Fiscais</p>
+          </div>
+        </div>
+        <p style="text-align: center; margin-bottom: 20px;"><strong>Obra:</strong> ${tituloObra}</p>
+        <table>
+          <thead>
+            <tr>
+              <th>NF</th>
+              <th>Obra</th>
+              <th>Fornecedor</th>
+              <th>Data Emissão</th>
+              <th>Data Pagamento</th>
+              <th>Forma Pagto</th>
+              <th>Frete (R$)</th>
+              <th>Valor Total (R$)</th>
+              <th>Status</th>
+              <th>Usuário da Baixa</th>
+              <th>Usuário Lançamento</th>  
+            </tr>
+          </thead>
+          <tbody>
+            ${listaNotas.map(nota => `
+              <tr>
+                <td>${nota.numero_nota}</td>
+                <td>${obrasMap[nota.obra_id] || '—'}</td>
+                <td>${fornecedoresMap[nota.fornecedor_id] || '—'}</td>
+                <td>${nota.data_emissao || '—'}</td>
+                <td>${nota.data_pagamento || '—'}</td>
+                <td>${nota.forma_pagamento || '—'}</td>
+                <td>${(parseFloat(nota.frete) || 0).toFixed(2).replace('.', ',')}</td>
+                <td>${(parseFloat(nota.valor_total) || 0).toFixed(2).replace('.', ',')}</td>
+                <td>${nota.status}</td>
+                <td>${nota.usuario_baixa || '—'}</td>
+                <td>${nota.usuario_lancamento || '—'}</td>  
+              </tr>
+            `).join('')}
+          </tbody>
+        </table>
+      </body>
+      </html>
+    `;
+
+    pdf.create(html, {
+      format: 'A4',
+      orientation: 'landscape',
+      border: '10mm'
+    }).toBuffer((err, buffer) => {
+      if (err) {
+        console.error('Erro ao gerar PDF da lista:', err);
+        return res.status(500).json({ error: 'Erro ao gerar PDF' });
+      }
+      res.setHeader('Content-Type', 'application/pdf');
+      res.setHeader('Content-Disposition', `inline; filename=notas-fiscais-${tituloObra.replace(/\s+/g, '-')}.pdf`);
+      res.send(buffer);
+    });
+  } catch (error) {
+    console.error('Erro ao gerar PDF da lista de notas fiscais:', error);
+    res.status(500).json({ error: 'Erro interno' });
+  }
+});
+
+/// GET /financeiro/contas-pagar
+app.get('/financeiro/contas-pagar', async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('notas_fiscais')
+      .select(`
+        id,
+        numero_nota,
+        data_emissao,
+        data_vencimento,
+        valor_total,
+        valor_pago,
+        status,
+        forma_pagamento,
+        fornecedor_id,
+        obra_id,
+        anexo_nota_fiscal,
+        anexo_boleto,
+        fornecedores!inner(nome_fantasia),
+        obras!inner(nome)
+      `)
+      .in('status', ['pendente', 'lançada'])
+      .order('data_vencimento', { ascending: true });
+
+    if (error) throw error;
+    // Aplica a formatação a cada item da lista
+    const dadosFormatados = data.map(nota => ({
+      ...nota,
+      data_pagamento: formatarDataParaLocal(nota.data_pagamento),
+      // data_emissao: formatarDataParaLocal(nota.data_emissao), // Opcional
+      // data_vencimento: formatarDataParaLocal(nota.data_vencimento), // Opcional
+    }));
+    res.json(data);
+  } catch (error) {
+    console.error('Erro em contas-pagar:', error);
+    res.status(500).json({ error: 'Erro ao carregar contas a pagar' });
+  }
+});
+
+// GET /financeiro/contas-pagas
+app.get('/financeiro/contas-pagas', async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('notas_fiscais')
+      .select(`
+        id,
+        numero_nota,
+        data_emissao,
+        data_vencimento,
+        data_pagamento,
+        valor_total,
+        valor_pago,
+        status,
+        forma_pagamento,
+        fornecedor_id,
+        obra_id,
+        usuario_baixa,
+        fornecedores!inner(nome_fantasia),
+        obras!inner(nome)
+      `)
+      .eq('status', 'pago') // ← FILTRO ESSENCIAL
+      .order('data_pagamento', { ascending: false });
+
+    if (error) throw error;
+
+    // Aplica a formatação a cada item da lista
+    const dadosFormatados = data.map(nota => ({
+      ...nota,
+      data_pagamento: formatarDataParaLocal(nota.data_pagamento),
+      // data_emissao: formatarDataParaLocal(nota.data_emissao), // Opcional
+      // data_vencimento: formatarDataParaLocal(nota.data_vencimento), // Opcional
+    }));
+    res.json(data);
+  } catch (error) {
+    console.error('Erro em contas-pagas:', error);
+    res.status(500).json({ error: 'Erro ao carregar contas pagas' });
+  }
+});
+
+// GET /obras/:id/itens-orcamento — Retorna todos os itens de orçamento da obra
+app.get('/obras/:id/itens-orcamento', async (req, res) => {
+  const { id } = req.params;
+  const obraId = parseInt(id, 10);
+  if (isNaN(obraId)) {
+    return res.status(400).json({ error: 'ID da obra inválido' });
+  }
+  try {
+    // Buscar o orçamento ativo/mais recente da obra
+    const { data: orcamentos, error: orcError } = await supabase
+      .from('orcamentos')
+      .select('id')
+      .eq('obra_id', obraId)
+      .order('created_at', { ascending: false })
+      .limit(1);
+    
+    if (orcError || !orcamentos || orcamentos.length === 0) {
+      console.warn(`Nenhum orçamento encontrado para obra ID ${obraId}`);
+      return res.json([]); // retorna array vazio, não erro
+    }
+
+    const orcamentoId = orcamentos[0].id;
+
+    // Buscar todos os itens desse orçamento
+    const { data: itens, error: itensError } = await supabase
+      .from('itens_orcamento')
+      .select('*')
+      .eq('orcamento_id', orcamentoId)
+      .order('ordem', { ascending: true });
+
+    if (itensError) {
+      console.error('Erro ao buscar itens do orçamento:', itensError);
+      return res.status(500).json({ error: 'Erro ao carregar itens do orçamento' });
+    }
+
+    res.json(itens || []);
+  } catch (error) {
+    console.error('Erro inesperado em /obras/:id/itens-orcamento:', error);
+    res.status(500).json({ error: 'Erro interno' });
+  }
+});
+
+// GET /relatorios/obra/:id/resumo — Dados consolidados para o relatório de obra
+app.get('/relatorios/obra/:id/resumo', async (req, res) => {
+  const { id } = req.params;
+  const obraId = parseInt(id, 10);
+  if (isNaN(obraId)) return res.status(400).json({ error: 'ID inválido' });
+
+  try {
+    // 1. Buscar dados da obra
+    const { data: obra, error: obraError } = await supabase
+      .from('obras')
+      .select('id, nome, valor_previsto, valor_realizado, evolucao_fisica')
+      .eq('id', obraId)
+      .single();
+    if (obraError || !obra) return res.status(404).json({ error: 'Obra não encontrada' });
+
+    // 2. Buscar valor orçado (do último orçamento)
+    const { data: orcamento, error: orcError } = await supabase
+      .from('orcamentos')
+      .select('valor_total')
+      .eq('obra_id', obraId)
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .single();
+    const valorOrcado = orcamento?.valor_total || obra.valor_previsto || 0;
+
+    // 3. Buscar valor realizado (notas pagas)
+    const { data: notas, error: notasError } = await supabase
+      .from('notas_fiscais')
+      .select('valor_total')
+      .eq('obra_id', obraId)
+      .eq('status', 'pago');
+    if (notasError) throw notasError;
+    const valorRealizado = notas.reduce((sum, n) => sum + (n.valor_total || 0), 0);
+
+    // 4. Calcular KPIs
+    const evolucaoFisica = obra.evolucao_fisica || 0;
+    const aderencia = valorOrcado > 0 ? ((valorRealizado / valorOrcado) * 100).toFixed(2) : 0;
+    const desvio = valorRealizado - valorOrcado;
+
+    res.json({
+      obra: {
+        id: obra.id,
+        nome: obra.nome
+      },
+      kpis: {
+        valor_orcado: valorOrcado,
+        valor_realizado: valorRealizado,
+        evolucao_fisica: evolucaoFisica,
+        aderencia: parseFloat(aderencia),
+        desvio: desvio
+      }
+    });
+  } catch (error) {
+    console.error('Erro ao gerar resumo da obra:', error);
+    res.status(500).json({ error: 'Erro interno' });
+  }
+});
+
+// GET /relatorios/financeiro-consolidado — Comparativo orçado x realizado
+app.get('/relatorios/financeiro-consolidado', async (req, res) => {
+  try {
+    // 1. Buscar todas as obras
+    const { data: obras, error: obrasError } = await supabase
+      .from('obras')
+      .select('id, nome, valor_previsto');
+    if (obrasError) throw obrasError;
+
+    // 2. Para cada obra, buscar valor orçado e realizado
+    const relatorio = await Promise.all(obras.map(async (obra) => {
+      // Orçamento mais recente
+      const { data: orc } = await supabase
+        .from('orcamentos')
+        .select('valor_total')
+        .eq('obra_id', obra.id)
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .single();
+      const valor_orcado = orc?.valor_total || obra.valor_previsto || 0;
+
+      // Notas fiscais pagas
+      const { data: notas } = await supabase
+        .from('notas_fiscais')
+        .select('valor_total')
+        .eq('obra_id', obra.id)
+        .eq('status', 'pago');
+      const valor_realizado = notas.reduce((sum, n) => sum + (n.valor_total || 0), 0);
+
+      return {
+        obra: obra.nome,
+        valor_orcado: valor_orcado,
+        valor_realizado: valor_realizado,
+        desvio: valor_realizado - valor_orcado
+      };
+    }));
+
+    res.json(relatorio);
+  } catch (error) {
+    console.error('Erro no relatório financeiro:', error);
+    res.status(500).json({ error: 'Erro interno' });
+  }
+});
+
+// GET /relatorios/obra/:obraId/realizado-por-item — COM ADM
+app.get('/relatorios/obra/:obraId/realizado-por-item', async (req, res) => {
+  const { obraId } = req.params;
+  const obraIdNum = parseInt(obraId, 10);
+  if (isNaN(obraIdNum)) {
+    return res.status(400).json({ error: 'ID da obra inválido' });
+  }
+  try {
+    // 1. Buscar orçamento ativo da obra para obter % de ADM
+    const { data: orcamento } = await supabase
+      .from('orcamentos')
+      .select('id, taxa_administracao')
+      .eq('obra_id', obraIdNum)
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .single();
+
+    const taxaADM = orcamento ? parseFloat(orcamento.taxa_administracao) || 0 : 0;
+    const temADM = taxaADM > 0;
+
+    // 2. Buscar todas as notas PAGAS da obra (com valor_total, valor_pago e frete)
+    const { data: notas, error: notasError } = await supabase
+      .from('notas_fiscais')
+      .select('id, valor_total, valor_pago, frete')
+      .eq('obra_id', obraIdNum)
+      .eq('status', 'pago');
+    if (notasError) throw notasError;
+    if (!notas || notas.length === 0) {
+      return res.json(temADM ? [{ orcamento_item_id: 'ADM', valor_realizado: '0.00' }] : []);
+    }
+
+    let valorTotalOrcado = 0;
+    let valorADMRealizado = 0;
+    let realizadoPorItem = new Map();
+
+    // 3. Obter valor orçado total do orçamento (só serviços)
+    if (orcamento) {
+      const { data: itensOrc } = await supabase
+        .from('itens_orcamento')
+        .select('quantidade, valor_unitario_material, valor_unitario_mao_obra')
+        .eq('orcamento_id', orcamento.id)
+        .eq('nivel', 'servico');
+      valorTotalOrcado = itensOrc.reduce((sum, item) => {
+        const qtd = parseFloat(item.quantidade) || 0;
+        const mat = parseFloat(item.valor_unitario_material) || 0;
+        const mao = parseFloat(item.valor_unitario_mao_obra) || 0;
+        return sum + qtd * (mat + mao);
+      }, 0);
+    }
+
+    // 4. Processar cada nota
+    for (const nota of notas) {
+      const notaId = nota.id;
+      const valorTotalNota = parseFloat(nota.valor_total) || 0;
+      const valorPago = parseFloat(nota.valor_pago) || 0;
+      const frete = parseFloat(nota.frete) || 0;
+      if (valorTotalNota <= 0 || valorPago <= 0) continue;
+
+      // Calcula valor orçado da nota (exclui frete)
+      const valorNotaSemFrete = valorTotalNota - frete;
+
+      // Calcula valor de ADM pago nesta nota (se houver taxa)
+      if (temADM && valorTotalOrcado > 0) {
+        const proporcaoADMNaNota = valorNotaSemFrete / valorTotalOrcado;
+        const valorADMNota = (taxaADM / 100) * valorTotalOrcado * proporcaoADMNaNota;
+        valorADMRealizado += valorADMNota;
+      }
+
+      // Distribuir valor pago aos itens da nota
+      const { data: itens, error: itensError } = await supabase
+        .from('itens_nota_fiscal')
+        .select('orcamento_item_id, preco_total')
+        .eq('nota_fiscal_id', notaId)
+        .not('orcamento_item_id', 'is', null);
+      if (itensError || !itens) continue;
+
+      for (const item of itens) {
+        const precoItem = parseFloat(item.preco_total) || 0;
+        if (precoItem <= 0) continue;
+        const proporcao = precoItem / valorTotalNota;
+        const valorRealizado = valorPago * proporcao;
+        const idItem = item.orcamento_item_id;
+        const totalAtual = realizadoPorItem.get(idItem) || 0;
+        realizadoPorItem.set(idItem, totalAtual + valorRealizado);
+      }
+    }
+
+    // 5. Formatar resultado
+    const resultado = Array.from(realizadoPorItem.entries()).map(([id, valor]) => ({
+      orcamento_item_id: parseInt(id, 10),
+      valor_realizado: parseFloat(valor).toFixed(2)
+    }));
+
+    // 6. Adicionar linha de ADM se aplicável
+    if (temADM) {
+      resultado.push({
+        orcamento_item_id: 'ADM',
+        valor_realizado: valorADMRealizado.toFixed(2)
+      });
+    }
+
+    res.json(resultado);
+  } catch (error) {
+    console.error('Erro em /realizado-por-item (com ADM):', error);
+    res.status(500).json({ error: 'Erro ao carregar realizado por item' });
+  }
+});
+
+// PDF: GET /relatorios/obra/:obraId/orcado-x-realizado/pdf
+app.get('/relatorios/obra/:obraId/orcado-x-realizado/pdf', async (req, res) => {
+  const { obraId } = req.params;
+  const obraIdNum = parseInt(obraId, 10);
+  if (isNaN(obraIdNum)) return res.status(400).json({ error: 'ID inválido' });
+
+  let browser;
+  try {
+    // === LOGO BASE64 ===
+    const LOGO_BASE64 = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAR8AAACNCAYAAACOjn6xAAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAAAJcEhZcwAAA+gAAAPoAbV7UmsAABl9SURBVHhe7Z0JlCVXXcbfkEQIk6CJuO9rFBcUtwPnuIa4RRSGDLhhVDSSaJaZ9HT39MykWTUSo4Aw3TPZIKIkbFGiHnfccMV9wR0V0YA7ajIk06/8fm/eN14r9ao7M13vpN77vnO+U/1u3Vt16/b7f+//v/fWvYMgCIIgCIIgCIIgCIIgCIIgCIIgCIIgCIIgCIIgCIIgCIIgCIIgCIIgCOYL1WCwI5wux00fBEEQBMFUUFUnfn2HhwcXDNcHu4Zrg6dVYfc8MnjqAy8fXKI2f0I8oGAuYfGpDg+WJTzvlDHco+M9G2uDd3EMu+PG+uDd4lEJ0Vmjf0YQzBNOej7rg0PV+uC4jGFDwjMMO6baWaJT6e/bIz7BXOKk+KwNDsggjul4XByKG+Nj2AXXBw8gQvr71ohPMJc4KT5HBweHRwbHNo5IdPhFXh/9OocdcNS+R0Ze5lDH2yI+wVyiCLsOyhiO6bih8Kt60C91uC3E2xm1LyEun9cjPsGcovR8RuIjz4e+CBnHkGO4vXS7qp3j+QTzjYjPdBnxCYIxIj7TZcQnCMaI+EyXEZ8gGCPiM11GfIJgjIjPdBnxCYIxIj7TZcQnCMaI+EyX8yg+fMHgI4pjEzbLx2dzEnyNkr6eUZ6bBJep5+FzWY+S9fyT0uvw+dPJQ3p5L9NpTSjPl6yX8ee2a50SIj7T5TyKzxkiD3jm+MiXuAl8EclT0l92n/N12vBI8RzxXPFskfsDX8v1cV2cbpDme7ksIJ/v38Qyf72+9XuUONX6GM7P8VEizw75u6mtyecynKeNaCuXKUG++nO47Gkj4jNdzpv48GX+anFZ3Ds+fov4PmIdXyAuigvj43eKHyCCTxNJXxG/Udwp1vGR4jPE54tHxJvFG8TLxU8VbUhfIS6J+8UnixhgaaSPF32vrxMfLYILRMpxztw3pp+NZwXvK36DyD14lk8Sm4BQUsb1+XyxXp/PEbkG9blEpAwoReATxUvF7xFvGpO/aeuPEUEpHLT/p4iXid8rkv+o+ELx68UPFcH7i/wfuP9V4ieIoLz3KSPiM13Oi/j4y/lY8Y1iVfCYyBcf2Mj49b1bLPP9i4gQAIzE6b8tfphY4iniz4nvFctrmD8vIgiI1u3jNIhAYYh4FK4zYuXzvyl+oAi+VnT6JP6oCD5O/C3R6QhmCd/rfPENovN9n1j3cBA1n+c5KEN5iBBx7V8XN0TnK/lqEdE13k+8VvwTsSk/17lOpF0Q/X8WSb9XRIxBKY6njIjPdDlv4nOeaGM/LiI8QxGDAs73JPEvRfLdPz7yGY8F8KtOedLfLH6w6LIIzztFzpkPiP8tci8+cx7BQuTWRF/rB0WMzCEF+DaRenKeeyGgYJdIGgI3ydDvFAHexi+KTscjK+F7ISS0j+uJ50FdSvG5RuR5OP/jIm1q7+g7xP8UfR9I/f6n+Px7Is8NCK2+W3Qbm/eJZZnbRPJ+svhX47R3i7QBiPj0kPMmPhjXD4l8eTEwGz1egQ0C8EuMQZDHhvbXosXnm0UbPILgsIAw4I9E0jn/b+K6+Czx6eKzRYz7Z0Q8GO7JeRv7y0TEh3+ADQrxsQeFgFh8uJ7v87ciYQ3hyEGRkIhw72tEgPhQT/LDSeKDkLh94IvEuvjsEd1uFh/wWeI/ijwLfIdICIV3Qnj2HBGvE0F0qEY9/kP089PGzxWfKe4WCa1+VqQehJuIz9+I5MUDog1AxKeHnHfxwXA58mv9JSIoQzPOW2Tq4mODQRAcdl0pkoZx/ruIiJ0rlsBYMSIambALz8fX+n6xDoTLnkGT+MBfEJ3ehO0UHzwftwniQ9hEeUI00jiH8FBvhLTEB4n0ByEW3Ou1osvg0TxRdF2MjxqTMoTHEZ8Z4byLj7/48BUioJP170XnsaG1iQ9GhYH+yDiNcz8m2iuYZByEEng+lIF/LCJG7nClTlzf3tck8flzkU7mbxLp1IV4TO7c7Vp8eA76vlyOZ6AcqIuJ8ekiIZjLHBAB5SaVifjMEOdZfDBoOi0dQrxV/BARVx/xgIQ79jomic8viYyCPWb8N2mQka1JcH1K8fE9LYYmaW3iwzmegT6S/xLpW4KEM+6Q/VhxO8Mui89PiIgPISQhF2n0T10tNoH7+F6MJrr/hna+SATlvQD5nRbxmSHOo/i4wxkj+Snx7ePP/yQiKreOPxOKMWLFKBefNxMfjPAt4zRIR+okuD518cGoEZKSWxEf16UkZekYB12Jjz0fRPtd4zSEjxG6zfDFotue/8UXiqBJSJwW8ZkhzrPnA+ncpAOUvxlh+V2Rzls+/6HIXBdEic9tYRfiwxwiPAHSIKGTjdb3N5rEByJk3yUSQmHkeGGvEdvEh3rgddwivkR8ucio2WHxs0VQD7vo0C1Rik859I+A8gyl+FA3iw/TERAf6NFBSGf3JPhenyv+qUh+hNLD/+W9APkjPjPIeRcfDInhYb78NnCLChMDnyZuRXw82uVOV879mUhoUQd1YbIcRob4lB3OLxbrhoSX0jbaBREWz/9pQl18PERdB6NvCJfz0YdVdhrz90tFn6ctzxURXs8P4lmY59M0kZEvFv8D2oBJmMwT8rV+UvQkzhKMcjEnijIRnxliPJ/B4KNFvsh8dgjDLzsza5lx7HOTxAej9mgXI2blfB7E4qtEhuAZsWGS4hUincmICIZVej50MDMMjTG7wxZx3Gy06/dFZiZ/psiQ9xNEPAvCLVAXH0SXvOSDeEiIAcDz8jQDRux4Vq7DNfBO7BlCZlP7y8IMatrPIs4ER0IpJjjSxtQLT5IRPZ4R8aX9HV5Shvk8rjf8PBFBxwtEGB8nRnxmhPMmPoQVrxItDkyi49ecvgs+ezIfBoZxfqXIXB3E6C9EfnkBo0o2Mn69mWQIEIwbRfI7NKETGE+A/iNGpUgrJxkSHtn48CqoD4bpOn+rSEjI+XJIvZxkSGczI3QYJnWnI5dQjBAMYPwWH+pN/wx56XOB/yAyTwgglL8mkpd2olP+l0XKI0akQ+YzuT2oK237wyLn/OwIxK+I1NuiQce+39lCmJjHU5bB00RkIfUijX44vESmKBDeUS8mGeKZgohPDzlv4kO4U399AGOnY9ZpkDx82ekbwfhI48v+GSLAG3FeJig67AKEDohIOUO3zreJiEj99Qr6ifAKyuFm3mXy+Yf6egWiCjByyjblMQmxDN43m/S6A0Tc8Doskq4rIsd17Kk1EbEuQzk8IkKuprwmky8R6vL1CkTdo3n1fqJTQsRnupwX8TEYDuc9IX6J+SXnHS2+uIjHXSK/tsw+xrABIzIYMAbDhDiMGBBK4cnQQUwfCaJWgj4KroGXhdETsvHL/zsi7zZxDoHBoHiJk+vjXRAO0fjlLznhFHXiXhghnbuAurm+eA/Qf/+0yPPxrIDno56kNeWnPXgxFVhICH/owGYED7HhGX5DJEy8UKx7G/6M+DLHiI5yOvB5bpdFXL9c9D18JKQjhEP0CSHxxvBwflUkFCX8Ii+h2OtE2ot5VLQBiOfTQ86b+PAlRSjo36APBpEApBM6kfbhot8cRxw+YkyGk90weCyk8UuPJ1L+8tqgAKEIM3rpU4F0wpZCRV7y+Fr8XZYH3Is6+V42NOro+rqOJmmco48LIHRMhJyUn/bg3obrwL0xeLwT6s+zIOCTUIoAnh3P62cnnHN7l8/ov2lDno9QjjfnuSdijwdq0P78H6gvz8H/Z9sQ8Zku5018poW6gNSx2fmHA9rqeDr1byr7sGiPiM90GfEJgjEiPtNlxCcIxoj4TJcRnyAYYzvFR2VOHsNmbqwNhqPj+uD4cf2tY8QnmE9st+eDYY2OYSPxdkZHeT60MeLz1rH4jP8Xp8Ig6B+68nxOph8tjv57vnky7Bq18fro/cQgmD90GXbdv3ZWde+RndV9R8+p7uM4+nu+ee/6zuGJ4znHj920c+M9R8+//eLLl8+7fHn5vNXV1fNXV/eIHDfnnj17zt+7d+9j9bdnzwdBf9CN+OyoNo6eVb3l+sdXL9n/zOrW1V3VTdc9vTp63a7w0K6h2mJ4RMebV3cNX3rwWW+/dt/i6xcXl8XFNy4tLb1hKySvSJk3LSwsjJYOrqoqIVjQH3QmPrfsrF73/IuqS698XnXtwlJ11bUr1dUhHBbH4bWLK9XKykp1QFw5cGD092Y8MM63vLxc7d+/v5IA1WfqB8HDH12Kz10vvLB6zp7rqgPLCzKUpfAEh8VxRHky+rzMUZ+XW+k8lJHoPKDjsX379nkVzYhP0B9MR3z2VUtLy9VyaA5HR3kuPo4FaHTcjM4X8Ql6jWmIz4o8n5H4PNgLmEfKczlxlHDwd3E84dlsxj56PlRsEktMSgeT0g1esqyfb0rzdSbRaEqro+ncZvm3cn6reZpYx6R0o61sp5i++Ix/8cNTYh/FhzehebOcN755k9vk87miK82b4KT5zfD6w/C2NctHeAM8o8zHfVg0jDeweWO7KS9vjpOvrAskjXMGZXlT3G+Gl0DUSKeMZ4hybcpQx/LNcIMyLM9BGZ61Cb4n9SnfWC/B2/X1+lOX+ho7ZX3K5yrBPfzs9bbqHBGffrGP4sMKgKw1w6JXPkLW62HBdL74gKUdWLuG1fm8R7sfiMWwWA719eKXivUHRXDYofMOkTVpWMuGxeXZDYKlJQyEkOuQj/vU68OmgxYT1q5hCVjWxGEZDGBBoM6rItdh+QqDZV2pI2vluI4+Uob1gVjMzOstl3kgqyiywD6Tv1jiAviezsvCatyXdYpcf1YeZG0irks+ynBkLR/qw7KoJXxN9vKiPlyP5Vtdj6kg4tMv9lF82FmBlfBYupTlRFkZD7JcKotq2bARFa+ax0JerIdjY+CXG3HgHIaE8fiX/gKRha44B1nelMW4vLUMAgS4Dh6Clx5lCdeyPixZiiF6zRq2o/Fyqhg4noHvyfo2iBzn2JrY8CqILHxmA/eR9YFYzpX7erfW8h/G+kbe+hl6N9X6dagL51m9kNUe/1X0MrUsx8rqj+SFDIOSzsqF5b18LZa19f0QbK8r7fOdIuLTL/ZRfFjEHONggXN+iVkknpX5vkxkESu7+3gaCIfXamYlQIAhIAheiB5RIA0hIATBAyCd3UfxatgBlVUBMXB25WQbYYMwj8XkfX3qQX0gdWPZUBseu5AikF7vmYXeDTwtViRkPeenkDAGKwqSl1UavTSrPSlWD2TrGjYX9C4bnPc/DQ+RpUp5Do7sLuqF8snjeuEdUie8FZ4R0cZr8Q6m7NfuZVOpM2l4Uy7vI+LOdkU8I2tdUy+vKDmVL1LEp1/so/isiBhA077oJTAkxKdcCJ4dLQAiY/FBYGxAlME7YRH00gMpQVk3DOJDSMN1nk1CCxAfvCHXh8XVETZAnxLig/dRis+3i+TF2OvA62KdZozcG/a5XhwtotyXkJHnZ4cKwPP6mdliCPFBZEoQ6lEe4XO/mfeyx2usiw+LwdN2eIKErOSjbdw/1PmXKeLTL/ZZfOifYCscSP8O/Q1enB18kfgOkV9h1kqmDAu/E0bwS+5woxQfGxxrKG+lwxTxuVmkDP1N9JG4TtDrNQO8CYSCnTBY55gyrK9MnfFIWJ95kviwyD2L5EOug/fFhoTscIGg8azAz8EuEezW8XciYSjeHddhaxuHge6ktvhcP/p0AuSxR/dKkecETeJjEGJSfxaF/3gRASfsw/sDEZ/w/7GP4kPYhbGwvxbiggHiRUDOGRYfwo0niWwCaMPBuOj45bPFh4f9gXEaHa4Go0UIAjthsAEgR0IMwHrIvg7bM5f1YeF1wiaD7XreIyKa1Mf7g2H0jCCx9XNdfFggn2uTjucCKceR3TVoh1J8/A+jH4twE2FBZOgkZ9towjTv4GHxQWTwxhAKhAaPkL4z7sM18Ja4LnTYRRuWXw6uzzOzcDzhIKNzXIvytO9UEPHpF/soPng+GC2GjofiXRzoVCbEMCw+dBZj3LywRjkEgFEob/ZXig+hHGnsWmHQf8NODGzBQ1hBpyxpAI/A4oO4uT7mxaKB14JA0VlL6LYoUo59ugjZ2PkBY23yfHgGdoGA1Jv9vDBu+lcQH4ddAEGkPRCm3SJ9RDw/ooKI4b0Aey7Un3YhP31OHLkndfVmfwgV+SeJDx3RdHxzLTxGyvBM5CVkdNjWKSI+/WJfxYcvNcPM9CdQSbNEGXYx6kKoxXbGGBreCQbNdRhRsiFibKSxtYtDDXaMYHscvCJGsxAvb/lShl1ch07rSfWx+LCVD/WG3mceAaKueDNstWNYfGzs5XURlHqfD2CjREbB8GYYQWOkDCH0875JJBz0dfCOyEvfDm3Gdj2IINsEeVPBJvFxm7EEAu1FOqEeHhz3ZMshhIy2xtPrHBGffrHP4sNOoR75aYLFB4/EQ770r9C3Qnmz9HwYNSLcYLiZX+5yczy8FUITBKQUH3c426OYBMIuyt4t2vgxbu8EChG2Unw82sXInoWtHO3i2UrxIc8LRMrcI3JthM07m3pnVEblDDwpxMZ9PoSU3piR7ZARHotP2efjLwdix71oN/b34n6Qe3uqw7LoaQWdIeLTL/ZRfBju5gtNiPNUkX4YRqYY1sWo3KGK+NAPwa+x5/4AhMNzdqA9H4yDkGFNJJ1f7IPiRWPSoYzxYqg23lJ86CdCOMr6PFG0h4Dng7jg+VCO+3GODmTSuQZ9OZPEx/8MHxFUxAdBs/jQ90LnNOEhO5KyR5b3+mJeEOEk13ueaBFzhzOencGmitSJtnMfEXW158NEQ+qBKLmfjKkGCBf3oW7MM6LPinCVOT/UoVNEfPrFPorPIZEvexMJFSw0DJvTP8OvMAYIeCCMjtm7/FJThofFsCwSlGfkBo+ifn06bdlx09djuJsRpHo+k7wWQzwp+lQQzXLjPoSIvibCQc57/3LgUSr6iew5uJ4YOd4FgmhPjFEwxJHQh7CsDoQNYfoDkcmUwPX3vvC0UflcpNOBTPo14zQmYQJG1Qhr6e9hjlUdbFjoyZP8UJTtvO2I+PSLfRQfRIW+G+almIQMGDC/zB7e5ovPbGRGwMohb0AHKA+JYdEf4Qf1EXFgThD9SoQgiMgNIt5EKRz0d9Cpy57x1KOsF/VhpMgeBq9N4CXQj1NfKhKvAG+Eco8jYQw8J+qId1Q3Wt6hoi+Ke/Ks1J3OasJRPDXEijTosozcEQLdKPo1EepPR/ZoBTnBbUB9eQY8Tb+ywrwk8hJCAupKu3BNP5MFhusQtuIF4hXR+Y6n5OtvOyI+/WIfxQej4ksNMWyTz3y5DSpPGGXjbwLn60ZdPjQGhcFifGX/TwnuyXU2qw/3IV+ZVsLny/uTxnXs9dTBfcoy5K0LWx1cizy+JsemdgBcn74un6vXx9fa7ItCnvqzbTsiPv1iH8VnGuDBmx5+UvpWMYsNerptsm2I+PSLfRUff+HrrKMprcRWzpechHo+s46mtBIPtUzTfTa7B9hqmab0prKTyhubnd8WRHz6xb6KTxA8CBGffjHiE8wMIj79YsQnmBlEfPrFiE8wM4j49IsRn2BmEPHpFyM+wcwg4tMvRnyCmUHEp1+M+AQzg4hPvxjxCWYGEZ9+MeITzAwiPv1ixCeYGUR8+sWITzAziPj0ixGfYGYQ8ekXIz7BzCDi0y9GfIKZQcSnX4z4BDODiE+/GPEJZgYRn34x4hPMDCI+/WLEJ5gZRHz6xYhPMDM4KT7rJ8RH3EBENtYGw1OiROv42o7h8Zt3Du96wYVDic9Q4iNjwXhGhvMggwq3zohPMDOw+ByX5yOv57Q8H3OC5zMymLoxhQ+NEZ9gZnDS8zk8OHh8bfDekeezJs9H4tPo2WyBI8/nlng+XTDiE8wMLD7yWJ5b0Wdz0zbw6I6qeuXO6u4XjTyf4crSwsbS/xlOo1GFW2PEJ5gZWHweWBtcIu/nToVbr5Hnc8fpcOPwjjvuv/XcV7/quovfdvXCoWo/4hPPZ1sY8QlmDtXq4Ex5P48e3jg4+7R55+Ds29586aOu2bv3xfv376+WFhfvLwyn0ajCrTHiEwSbYfdrz1hYXLx+JD5LSxGfbWLEJ5hJEIJV+gKfNnWdyy677KylpX03RHy2lxGfIGhBVVUj8ZFxnAi7Ij7bxohPELQg4tMdIz5B0IKIT3eM+ARBCyI+3THiEwQtiPh0x4hPELQg4tMdIz5B0IKIT3eM+ARBCyI+3THiEwQtiPh0x4hPELQg4tMdIz5B0IKIT3eM+ARBCyI+3THiEwQtiPh0x4hPELQg4tMdIz5B0IKIT3eM+ARBCyI+3THiEwQtiPh0x4hPELQg4tMdIz5B0IKIT3eM+ARBCyI+3THiEwQtiPh0x4hPELQg4tMdIz5B0IKIT3eM+ARBCyI+3THiEwQtiPh0x4hPELQg4tMdIz5B0IKIT3eM+ARBCyI+3THiEwQtiPh0x4hPELQg4tMdIz5B0IKIT3eM+ARBCyI+3THiEwQtiPh0x4hPELQg4tMdIz5B0II28QlPnxGfIJgAxGd1dfXMQnyOyWCO6xhuA2lLte2G/j4G9fdV46aP+ATzjcLzedmhQ4eqlZWV6sCBAyeP4amzbEP+xqNcWFhYHDd9xCeYe+zYvXv3GRKfZ8jzuVXHV+gXek3HNY7hqdNtyFHh1mH9fVTi8+RxuwdBAK688spHKvx6zBVXXHGOjuE2k3ZVGz8GL3Pc5EEQjEHfzyPwgjiG3ZB2PtHcp4rB4H8BEvQbxGLVcCgAAAAASUVORK5CYI'
+
+    // 1. Buscar o orçamento MAIS RECENTE da obra (por obra_id)
+    const { data: orcamento } = await supabase
+      .from('orcamentos')
+      .select('id, obra_id, data_base, taxa_administracao, valor_total')
+      .eq('obra_id', obraIdNum) // ✅ CORRETO: filtra por obra_id
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .single();
+      
+    if (!orcamento) {
+      return res.status(404).json({ error: 'Orçamento não encontrado para esta obra' });
+    }
+
+    // 2. Buscar obra
+    const { data: obra } = await supabase
+      .from('obras')
+      .select('nome, proprietario, endereco')
+      .eq('id', obraIdNum)
+      .single();
+
+    // 3. Buscar ITENS do orçamento
+    const { data: itensOrcamento } = await supabase
+      .from('itens_orcamento')
+      .select('id, nivel, codigo, descricao, unidade, quantidade, valor_unitario_material, valor_unitario_mao_obra, ordem')
+      .eq('orcamento_id', orcamento.id)
+      .order('ordem', { ascending: true });
+
+    // Calcular totais
+    const itensComTotais = itensOrcamento.map(item => {
+      const qtd = item.quantidade || 0;
+      const mat = item.valor_unitario_material || 0;
+      const mao = item.valor_unitario_mao_obra || 0;
+      return {
+        ...item,
+        total_material: qtd * mat,
+        total_mao_obra: qtd * mao,
+        total_item: qtd * (mat + mao)
+      };
+    });
+
+        // 4. Buscar valor REALIZADO por item (reutiliza a rota do frontend)
+    const { data: realizadoRaw } = await axios.get(
+      `http://localhost:3001/relatorios/obra/${obraIdNum}/realizado-por-item`
+    );
+
+    const realizadoMap = new Map();
+    realizadoRaw.forEach(item => {
+      realizadoMap.set(item.orcamento_item_id, parseFloat(item.valor_realizado) || 0);
+    });
+    // Combinar
+    const itensComRealizado = itensComTotais.map(item => ({
+      ...item,
+      realizado: realizadoMap.get(item.id) || 0
+    }));
+
+    const dataBase = orcamento.data_base ? new Date(orcamento.data_base).toLocaleDateString('pt-BR') : '—';
+
+    const html = `
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <meta charset="utf-8">
+        <title>Orçado x Realizado - Obra ${obra?.nome || '—'}</title>
+        <style>
+  body {
+    font-family: Arial, sans-serif;
+    font-size: 7pt;
+    margin: 0;
+    padding: 0;
+    line-height: 1.2;
+  }
+  .container {
+    width: 210mm;
+    margin: 0 auto;
+    padding: 10mm;
+    box-sizing: border-box;
+  }
+  .header {
+    display: flex;
+    align-items: flex-start;
+    gap: 12px;
+    margin-bottom: 15px;
+    border-bottom: 2px solid #1e3a8a;
+    padding-bottom: 10px;
+  }
+  .header img {
+    height: 35px;
+    width: auto;
+    max-width: 140px;
+    object-fit: contain;
+  }
+  .header-info h1 {
+    font-size: 12pt;
+    color: #1e3a8a;
+    margin: 0 0 4px 0;
+  }
+  .header-info p {
+    font-size: 8pt;
+    margin: 0;
+    color: #4b5563;
+  }
+  .obra-info {
+    margin-bottom: 12px;
+    font-size: 7.5pt;
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin-top: 10px;
+    /* ✅ REMOVIDO: table-layout: fixed → deixa o navegador ajustar as colunas automaticamente */
+  }
+  th, td {
+    border: 1px solid #ccc;
+    padding: 3px 6px; /* ✅ padding ligeiramente aumentado para respirar */
+    vertical-align: top;
+    text-align: left;
+    overflow: hidden;
+    word-wrap: break-word;
+    font-size: 7pt;
+  }
+  th {
+    background-color: #f1f5f9;
+    font-weight: bold;
+    text-align: center;
+  }
+  .totals {
+    margin-top: 15px;
+    font-size: 7.5pt;
+  }
+  .totals div {
+    margin: 4px 0;
+  }
+</style>
+      </head>
+      <body>
+        <div class="container">
+          <div class="header">
+            <div class="logo-section">
+              <img src="${LOGO_BASE64}" alt="Logo da Empresa">
+            </div>
+            <div class="title-section">
+              <h1>ERP MINHAS OBRAS</h1>
+              <p>RELATÓRIO ORÇADO X REALIZADO</p>
+            </div>
+          </div>
+          <div class="obra-info">
+            <strong>Obra:</strong> ${obra?.nome || '—'}<br>
+            <strong>Cliente:</strong> ${obra?.proprietario || '—'}<br>
+            <strong>Endereço:</strong> ${obra?.endereco || '—'}<br>
+            <strong>Data Base:</strong> ${dataBase}
+          </div>
+          <table>
+            <thead>
+              <tr>
+                <th>Cód.</th>
+                <th>Descrição</th>
+                <th>Und</th>
+                <th>Qtd</th>
+                <th>R$ Unit. Mat.</th>
+                <th>R$ Unit. Mão Obra</th>
+                <th>R$ Orçado Total</th>
+                <th>R$ Realizado</th>
+                <th>% Executado</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${itensComRealizado.map(item => {
+                const indent = item.nivel === 'local' ? 0 :
+                               item.nivel === 'etapa' ? 10 :
+                               item.nivel === 'subetapa' ? 20 : 30;
+                const isServico = item.nivel === 'servico';
+                const percentual = item.total_item > 0 ? ((item.realizado / item.total_item) * 100) : 0;
+
+                return `
+                  <tr>
+                    <td style="padding-left: ${indent}px; font-weight: ${item.nivel === 'local' ? 'bold' : 'normal'};">${item.codigo}</td>
+                    <td style="font-weight: ${item.nivel === 'local' ? 'bold' : 'normal'};">${item.descricao}</td>
+                    <td>${isServico ? (item.unidade || '—') : ''}</td>
+                    <td style="text-align: right;">${isServico ? parseFloat(item.quantidade).toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 4 }) : ''}</td>
+                    <td style="text-align: right;">${isServico ? parseFloat(item.valor_unitario_material).toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' }) : ''}</td>
+                    <td style="text-align: right;">${isServico ? parseFloat(item.valor_unitario_mao_obra).toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' }) : ''}</td>
+                    <td style="text-align: right; font-weight: ${item.nivel === 'local' ? 'bold' : 'normal'};">${parseFloat(item.total_item).toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' })}</td>
+                    <td style="text-align: right; font-weight: bold; color: #1E40AF;">${parseFloat(item.realizado).toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' })}</td>
+                    <td style="text-align: right;">${item.total_item > 0 ? percentual.toFixed(1) + '%' : '—'}</td>
+                  </tr>
+                `;
+              }).join('')}
+            </tbody>
+          </table>
+        </div>
+      </body>
+      </html>
+    `;
+
+    browser = await puppeteer.launch({ headless: true });
+    const page = await browser.newPage();
+    await page.setContent(html, { waitUntil: 'networkidle0', timeout: 30000 });
+    const pdfBuffer = await page.pdf({ format: 'A4', printBackground: true });
+    await browser.close();
+
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `inline; filename=orcado-x-realizado-obra-${obraIdNum}.pdf`);
+    res.end(pdfBuffer);
+
+  } catch (error) {
+    console.error('❌ Erro ao gerar PDF Orçado x Realizado:', error);
+    if (browser) await browser.close().catch(() => {});
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'Erro ao gerar PDF' });
+    }
+  }
+});
+
+// EXCEL: GET /relatorios/obra/:id/orcado-x-realizado/excel
+app.get('/relatorios/obra/:id/orcado-x-realizado/excel', requirePermission('relatorios.acessar', true), async (req, res) => {
+  const obraIdNum = parseInt(req.params.id, 10);
+  if (isNaN(obraIdNum)) return res.status(400).json({ error: 'ID inválido' });
+
+  try {
+    // 1. Buscar o ORÇAMENTO MAIS RECENTE da OBRA
+    const { data: orcamentos, error: orcError } = await supabase
+      .from('orcamentos')
+      .select('id')
+      .eq('obra_id', obraIdNum)
+      .order('created_at', { ascending: false })
+      .limit(1);
+
+    if (orcError || !orcamentos || orcamentos.length === 0) {
+      return res.status(404).json({ error: 'Orçamento não encontrado para esta obra' });
+    }
+
+    const orcamentoId = orcamentos[0].id;
+
+    // 2. Buscar ITENS do orçamento
+    const { data: itensOrcamento, error: itensError } = await supabase
+      .from('itens_orcamento')
+      .select('*')
+      .eq('orcamento_id', orcamentoId)
+      .order('ordem', { ascending: true });
+
+    if (itensError) throw itensError;
+
+    // 3. Buscar valor REALIZADO por item
+    const { data: realizadoRaw } = await axios.get(
+      `http://localhost:3001/relatorios/obra/${obraIdNum}/realizado-por-item`,
+      { headers: { 'X-User-ID': req.headers['x-user-id'] } }
+    );
+
+    const realizadoMap = new Map();
+    realizadoRaw.forEach(item => {
+      realizadoMap.set(item.orcamento_item_id, parseFloat(item.valor_realizado) || 0);
+    });
+
+    // 4. Combinar dados
+    const itensComRealizado = itensOrcamento.map(item => ({
+      ...item,
+      realizado: realizadoMap.get(item.id) || 0,
+      total_item: (parseFloat(item.quantidade) * (parseFloat(item.valor_unitario_material || 0) + parseFloat(item.valor_unitario_mao_obra || 0))) || 0,
+      quantidade: item.quantidade ? parseFloat(item.quantidade) : null,
+      valor_unitario_material: item.valor_unitario_material ? parseFloat(item.valor_unitario_material) : null,
+      valor_unitario_mao_obra: item.valor_unitario_mao_obra ? parseFloat(item.valor_unitario_mao_obra) : null,
+    }));
+
+    // 5. Criar Excel
+    const workbook = new ExcelJS.Workbook();
+    const worksheet = workbook.addWorksheet('Orçado x Realizado');
+
+    // Estilo de borda fina (completa em todos os lados)
+    const thinBorder = {
+      top: { style: 'thin' },
+      left: { style: 'thin' },
+      bottom: { style: 'thin' },
+      right: { style: 'thin' }
+    };
+
+    // Estilo do cabeçalho: fundo azul escuro (#1E3A8A), fonte branca
+    const headerStyle = {
+      font: { bold: true, color: { argb: 'FFFFFFFF' } },
+      fill: { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1E3A8A' } },
+      alignment: { horizontal: 'center' },
+      border: thinBorder
+    };
+
+    // Cabeçalho
+    const headerRow = worksheet.addRow([
+      'Código', 'Descrição', 'Und', 'Qtd', 'Vlr Unit. Mat.',
+      'Vlr Unit. Mão Obra', 'Orçado Total', 'Realizado', '% Executado'
+    ]);
+    headerRow.eachCell(cell => {
+      Object.assign(cell, headerStyle);
+    });
+
+    // Dados
+    itensComRealizado.forEach(item => {
+      const isServico = item.nivel === 'servico';
+      const isBold = !isServico;
+      const percentual = item.total_item > 0 ? (item.realizado / item.total_item) : null;
+
+      const row = worksheet.addRow([
+        item.codigo || '',
+        item.descricao || '',
+        isServico ? (item.unidade || '') : '',
+        isServico ? item.quantidade : '',
+        isServico ? item.valor_unitario_material : '',
+        isServico ? item.valor_unitario_mao_obra : '',
+        item.total_item || 0,
+        item.realizado || 0,
+        percentual
+      ]);
+
+      // ✅ APLICAR BORDA FINA EM TODAS AS CÉLULAS (mesmo vazias)
+      row.eachCell(cell => {
+        cell.border = thinBorder;
+      });
+
+      // Estilo negrito para Locais, Etapas, Subetapas
+      if (isBold) {
+        row.eachCell(cell => {
+          if (!cell.style.font) cell.style.font = {};
+          cell.style.font.bold = true;
+        });
+      }
+
+      // Formatação monetária (colunas 5 a 8)
+      [5, 6, 7, 8].forEach(colIndex => {
+        const cell = row.getCell(colIndex);
+        if (cell.value != null && cell.value !== '') {
+          cell.numFmt = 'R$ #,##0.00';
+          cell.alignment = { horizontal: 'right' };
+        }
+      });
+
+      // Formatação percentual (coluna 9)
+      const pctCell = row.getCell(9);
+      if (pctCell.value != null && pctCell.value !== '') {
+        pctCell.numFmt = '0.00%';
+        pctCell.alignment = { horizontal: 'right' };
+      }
+    });
+
+    // Ajustar largura das colunas
+    const colWidths = [14, 35, 8, 10, 15, 18, 15, 15, 14];
+    colWidths.forEach((width, i) => {
+      worksheet.getColumn(i + 1).width = width;
+    });
+
+    // Enviar arquivo
+    const buffer = await workbook.xlsx.writeBuffer();
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', `attachment; filename=orcado-x-realizado-obra-${obraIdNum}.xlsx`);
+    res.send(Buffer.from(buffer));
+  } catch (error) {
+    console.error('❌ Erro ao gerar Excel Orçado x Realizado:', error);
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'Erro interno ao gerar relatório Excel' });
+    }
+  }
+});
+
+console.log('🚀 SERVIDOR PERSONALIZADO DO ERP MINHAS OBRAS INICIADO!');
+
+// === FIM DO DEBUG ===
+// Iniciar servidor
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`✅ Backend rodando em http://localhost:${PORT}`);
+  console.log(`🔗 Supabase URL: ${supabaseUrl}`);
+  console.log('🔑 Usando chave SERVICE_ROLE — permissões completas');
+});
