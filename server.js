@@ -2419,56 +2419,25 @@ app.post('/orcamentos', async (req, res) => {
 
     console.log('✅ Orçamento criado com ID:', orcamento.id);
 
-    // 2. Inserir itens
-    let ordem = 0;
-    const itensParaInserir = [];
-    let contadorLocal = 0;
-    let contadorEtapa = {};
-    let contadorSubetapa = {};
-
-    for (const item of itens) {
-      if (!item.nivel || !item.descricao) continue;
-
-      ordem++;
-      let codigo = '';
-
-      if (item.nivel === 'local') {
-        contadorLocal++;
-        codigo = String(contadorLocal).padStart(2, '0');
-        contadorEtapa[contadorLocal] = 0;
-        contadorSubetapa[contadorLocal] = {};
-      } else if (item.nivel === 'etapa') {
-        const localId = contadorLocal;
-        contadorEtapa[localId] = (contadorEtapa[localId] || 0) + 1;
-        codigo = `${String(localId).padStart(2, '0')}.${String(contadorEtapa[localId]).padStart(2, '0')}`;
-        contadorSubetapa[localId][contadorEtapa[localId]] = 0;
-      } else if (item.nivel === 'subetapa') {
-        const localId = contadorLocal;
-        const etapaId = contadorEtapa[localId] || 1;
-        contadorSubetapa[localId][etapaId] = (contadorSubetapa[localId][etapaId] || 0) + 1;
-        codigo = `${String(localId).padStart(2, '0')}.${String(etapaId).padStart(2, '0')}.${String(contadorSubetapa[localId][etapaId]).padStart(2, '0')}`;
-      } else if (item.nivel === 'servico') {
-        const localId = contadorLocal;
-        const etapaId = contadorEtapa[localId] || 1;
-        const subetapaId = contadorSubetapa[localId][etapaId] || 1;
-        const servicosNaSubetapa = itensParaInserir.filter(i => 
-          i.codigo.startsWith(`${String(localId).padStart(2, '0')}.${String(etapaId).padStart(2, '0')}.${String(subetapaId).padStart(2, '0')}`)
-        ).length + 1;
-        codigo = `${String(localId).padStart(2, '0')}.${String(etapaId).padStart(2, '0')}.${String(subetapaId).padStart(2, '0')}.${String(servicosNaSubetapa).padStart(2, '0')}`;
-      }
-
-      itensParaInserir.push({
-        orcamento_id: orcamento.id,
-        nivel: item.nivel,
-        codigo,
-        descricao: item.descricao,
-        unidade: item.nivel === 'servico' ? (item.unidade || null) : null,
-        quantidade: item.nivel === 'servico' ? (parseFloat(item.quantidade) || 0) : null,
-        valor_unitario_material: item.nivel === 'servico' ? (parseFloat(item.valor_unitario_material) || 0) : null,
-        valor_unitario_mao_obra: item.nivel === 'servico' ? (parseFloat(item.valor_unitario_mao_obra) || 0) : null,
-        ordem
-      });
-    }
+    // ✅ IMPORTAÇÃO: usar os códigos da planilha, NÃO gerar novos
+let ordem = 0;
+const itensParaInserir = itens
+  .filter(item => item.nivel && item.descricao) // remove linhas vazias
+  .map(item => {
+    ordem++;
+    return {
+      orcamento_id: orcamento.id,
+      nivel: item.nivel,
+      codigo: item.codigo?.trim() || '', // ← usa o código da planilha
+      descricao: item.descricao,
+      unidade: item.nivel === 'servico' ? (item.unidade || null) : null,
+      quantidade: item.nivel === 'servico' ? (parseFloat(item.quantidade) || 0) : null,
+      valor_unitario_material: item.nivel === 'servico' ? (parseFloat(item.valor_unitario_material) || 0) : null,
+      valor_unitario_mao_obra: item.nivel === 'servico' ? (parseFloat(item.valor_unitario_mao_obra) || 0) : null,
+      ordem
+    };
+  });
+    
 
     console.log('📤 Enviando', itensParaInserir.length, 'itens para inserção');
     const { error: itensError } = await supabase
