@@ -21,6 +21,107 @@ const ExcelJS = require('exceljs'); // ← Adicione esta linha no topo
 const nodemailer = require('nodemailer');
 const axios = require('axios');
 
+// ==========
+// FUNÇÃO REUTILIZÁVEL: calcular realizado por item (sem depender de axios)
+// ==========
+async function calcularRealizadoPorItem(obraIdNum) {
+  try {
+    // 1. Buscar orçamento ativo da obra para obter % de ADM
+    const { data: orcamento } = await supabase
+      .from('orcamentos')
+      .select('id, taxa_administracao')
+      .eq('obra_id', obraIdNum)
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .single();
+
+    const taxaADM = orcamento ? parseFloat(orcamento.taxa_administracao) || 0 : 0;
+    const temADM = taxaADM > 0;
+
+    // 2. Buscar todas as notas PAGAS da obra (com valor_total, valor_pago e frete)
+    const { data: notas, error: notasError } = await supabase
+      .from('notas_fiscais')
+      .select('id, valor_total, valor_pago, frete')
+      .eq('obra_id', obraIdNum)
+      .eq('status', 'pago');
+    if (notasError) throw notasError;
+    if (!notas || notas.length === 0) {
+      return temADM ? [{ orcamento_item_id: 'ADM', valor_realizado: '0.00' }] : [];
+    }
+
+    let valorTotalOrcado = 0;
+    let valorADMRealizado = 0;
+    let realizadoPorItem = new Map();
+
+    // 3. Obter valor orçado total do orçamento (só serviços)
+    if (orcamento) {
+      const { data: itensOrc } = await supabase
+        .from('itens_orcamento')
+        .select('quantidade, valor_unitario_material, valor_unitario_mao_obra')
+        .eq('orcamento_id', orcamento.id)
+        .eq('nivel', 'servico');
+      valorTotalOrcado = itensOrc.reduce((sum, item) => {
+        const qtd = parseFloat(item.quantidade) || 0;
+        const mat = parseFloat(item.valor_unitario_material) || 0;
+        const mao = parseFloat(item.valor_unitario_mao_obra) || 0;
+        return sum + qtd * (mat + mao);
+      }, 0);
+    }
+
+    // 4. Processar cada nota
+    for (const nota of notas) {
+      const notaId = nota.id;
+      const valorTotalNota = parseFloat(nota.valor_total) || 0;
+      const valorPago = parseFloat(nota.valor_pago) || 0;
+      const frete = parseFloat(nota.frete) || 0;
+      if (valorTotalNota <= 0 || valorPago <= 0) continue;
+
+      const valorNotaSemFrete = valorTotalNota - frete;
+      if (temADM && valorTotalOrcado > 0) {
+        const proporcaoADMNaNota = valorNotaSemFrete / valorTotalOrcado;
+        const valorADMNota = (taxaADM / 100) * valorTotalOrcado * proporcaoADMNaNota;
+        valorADMRealizado += valorADMNota;
+      }
+
+      const { data: itens, error: itensError } = await supabase
+        .from('itens_nota_fiscal')
+        .select('orcamento_item_id, preco_total')
+        .eq('nota_fiscal_id', notaId)
+        .not('orcamento_item_id', 'is', null);
+      if (itensError || !itens) continue;
+
+      for (const item of itens) {
+        const precoItem = parseFloat(item.preco_total) || 0;
+        if (precoItem <= 0) continue;
+        const proporcao = precoItem / valorTotalNota;
+        const valorRealizado = valorPago * proporcao;
+        const idItem = item.orcamento_item_id;
+        const totalAtual = realizadoPorItem.get(idItem) || 0;
+        realizadoPorItem.set(idItem, totalAtual + valorRealizado);
+      }
+    }
+
+    // 5. Formatar resultado
+    const resultado = Array.from(realizadoPorItem.entries()).map(([id, valor]) => ({
+      orcamento_item_id: parseInt(id, 10),
+      valor_realizado: parseFloat(valor).toFixed(2)
+    }));
+
+    // 6. Adicionar linha de ADM se aplicável
+    if (temADM) {
+      resultado.push({
+        orcamento_item_id: 'ADM',
+        valor_realizado: valorADMRealizado.toFixed(2)
+      });
+    }
+
+    return resultado;
+  } catch (error) {
+    console.error('Erro em calcularRealizadoPorItem:', error);
+    throw error;
+  }
+}
+
 
 // Função para converter data no formato DD/MM/YYYY → YYYY-MM-DD
 function converterDataBRParaISO(dataBR) {
@@ -83,10 +184,13 @@ app.use((req, res, next) => {
   next();
 });
 
-// Log global de todas as requisições
+// ✅ LOG SEGURO (sem corromper o body)
 app.use((req, res, next) => {
   console.log(`📨 ${req.method} ${req.url}`);
-  console.log(`📥 Body:`, req.body);
+  // Só loga body em requisições que não são POST/PUT (evita corromper uploads)
+  if (req.method !== 'POST' && req.method !== 'PUT') {
+    console.log(`📥 Body:`, req.body);
+  }
   next();
 });
 
@@ -99,106 +203,7 @@ const getUserFromRequest = (req) => {
   return isNaN(num) ? null : num;
 };
 
-// Middleware de autorização por tela e obra (VERSÃO ATUALIZADA)
-const requirePermission = (telaRequerida, verificarObra = false) => {
-  return async (req, res, next) => {
-    const userId = getUserFromRequest(req);
-    if (!userId) {
-      return res.status(401).json({ error: 'Usuário não autenticado' });
-    }
 
-    try {
-      // 1. Buscar usuário completo
-      const { data: usuario, error: userError } = await supabase
-        .from('usuarios')
-        .select('role, permissions')
-        .eq('id', userId)
-        .single();
-
-      if (userError || !usuario) {
-        return res.status(404).json({ error: 'Usuário não encontrado' });
-      }
-
-      // 2. Bypass total para role 'master'
-      if (usuario.role === 'master') {
-        return next();
-      }
-
-      // 3. Parsear permissões (pode ser string JSON ou array)
-      let permissoes = [];
-      try {
-        permissoes = typeof usuario.permissions === 'string' 
-          ? JSON.parse(usuario.permissions)
-          : usuario.permissions;
-      } catch (e) {
-        permissoes = [];
-      }
-
-      // 4. Verificar permissão
-      const temPermissao = permissoes.includes('*') || permissoes.includes(telaRequerida);
-      if (!temPermissao) {
-        return res.status(403).json({ error: 'Acesso negado: permissão insuficiente para esta tela' });
-      }
-
-      // 5. Verificar acesso à obra (se necessário)
-      if (verificarObra) {
-        let obraId;
-        if (req.params?.id && (req.url.includes('/obras/') || req.url.includes('/diarios-obras/') || req.url.includes('/notas-fiscais/')  || req.url.includes('/relatorios/obra/'))) {
-          obraId = parseInt(req.params.id, 10);
-        } 
-        else if (req.query?.obra_id) {
-          obraId = parseInt(req.query.obra_id, 10);
-        } else if (req.body?.obra_id) {
-          obraId = parseInt(req.body.obra_id, 10);
-        }
-        if (!obraId) {
-          return res.status(400).json({ error: 'Obra não especificada' });
-        }
-
-        // Bypass para admin/master ou se não usar acesso_obras_usuario
-        if (usuario.role === 'admin' || usuario.role === 'master') {
-          return next();
-        }
-
-        // (Opcional) Verificar na tabela acesso_obras_usuario apenas para usuários comuns
-        const {  acessoObra, error: obraError } = await supabase
-          .from('acesso_obras_usuario')
-          .select('obra_id')
-          .eq('usuario_id', userId)
-          .eq('obra_id', obraId);
-        if (obraError || !acessoObra.length) {
-          return res.status(403).json({ error: 'Acesso negado: esta obra não está autorizada para você' });
-        }
-      }
-
-      next();
-    } catch (error) {
-      console.error('Erro no middleware de permissão:', error);
-      res.status(500).json({ error: 'Erro interno de autorização' });
-    }
-  };
-};
-// === FIM: Middleware de Autorização ===
-
-// Rota de saúde
-app.get('/health', (req, res) => {
-  res.json({ status: 'OK', message: 'Backend operacional' });
-});
-
-// Rota raiz
-app.get('/', (req, res) => {
-  res.json({
-    message: '✅ Backend conectado ao Supabase',
-    rotas: [
-      'GET /health',
-      'GET /obras',
-      'GET /users',
-      'GET /diarios-obras'
-    ]
-  });
-});
-
-// ========================
 // ========================
 // ROTAS DE OBRAS
 // ========================
@@ -220,8 +225,22 @@ app.get('/obras', async (req, res) => { // ← SEM PROTEÇÃO
   }
 });
 
+// Middleware simples de autenticação
+const requireAuth = async (req, res, next) => {
+  const userId = getUserFromRequest(req);
+  if (!userId) {
+    return res.status(401).json({ error: 'Usuário não autenticado' });
+  }
+  next();
+};
+
+// Use assim:
+app.get('/obras', requireAuth, async (req, res) => {
+  // ...
+});
+
 // GET /obras/:id (exige permissão + acesso à obra específica)
-app.get('/obras/:id', requirePermission('obras.visualizar', true), async (req, res) => {
+app.get('/obras/:id', async (req, res) => {
   const { id } = req.params;
   const obraId = parseInt(id, 10);
   if (isNaN(obraId)) {
@@ -896,43 +915,45 @@ const generateToken = () => crypto.randomBytes(32).toString('hex');
 // ROTAS DE USUÁRIOS — CRUD COMPLETO
 // ========================
 
-// Função auxiliar para normalizar permissions
-const normalizePermissions = (perms) => {
-  if (Array.isArray(perms)) return perms;
-  if (typeof perms === 'string') {
-    try {
-      return JSON.parse(perms);
-    } catch (e) {
-      console.warn('Permissions inválidas:', perms);
-    }
-  }
-  return ['obras:read'];
-};
-
-// GET /users
+// GET /users — Listar todos os usuários com permissões
 app.get('/users', async (req, res) => {
   try {
-    const { data, error } = await supabase
+    // 1. Buscar usuários
+    const { data: usuarios, error } = await supabase
       .from('usuarios')
-      .select('*');
+      .select('id, name, email, role, created_at, cliente_id');
 
     if (error) {
       console.error('Erro ao buscar usuários:', error);
       return res.status(500).json({ error: 'Erro ao buscar usuários' });
     }
 
-    const usuariosSemSenha = data.map(user => {
-      const { password, ...usuario } = user;
-      return {
-        ...usuario,
-        permissions: normalizePermissions(usuario.permissions)
-      };
-    });
+    // 2. Buscar todas as permissões
+    const { data: todasPermissoes, error: permError } = await supabase
+      .from('permissoes_usuario')
+      .select('usuario_id, tela');
 
-    res.json(usuariosSemSenha);
+    if (permError) {
+      console.warn('Erro ao carregar permissões:', permError);
+    }
+
+    // 3. Mapear permissões por usuário
+    const permissoesPorUsuario = (todasPermissoes || []).reduce((acc, p) => {
+      if (!acc[p.usuario_id]) acc[p.usuario_id] = [];
+      acc[p.usuario_id].push(p.tela);
+      return acc;
+    }, {});
+
+    // 4. Adicionar permissões a cada usuário
+    const usuariosComPermissoes = (usuarios || []).map(usuario => ({
+      ...usuario,
+      permissions: permissoesPorUsuario[usuario.id] || []
+    }));
+
+    res.json(usuariosComPermissoes);
   } catch (error) {
-    console.error('Erro interno ao buscar usuários:', error);
-    res.status(500).json({ error: 'Erro interno' });
+    console.error('Erro ao listar usuários:', error);
+    res.status(500).json({ error: 'Erro interno ao listar usuários' });
   }
 });
 
@@ -1001,80 +1022,109 @@ app.put('/users/change-password', async (req, res) => {
   }
 });
 
-// GET /users/:id
+// ✅ GET /users/:id — Corrigido (sem depender da coluna 'permissions')
 app.get('/users/:id', async (req, res) => {
   const { id } = req.params;
   const userId = parseInt(id, 10);
-
   if (isNaN(userId)) {
     return res.status(400).json({ error: 'ID inválido' });
   }
 
   try {
-    const { data, error } = await supabase
+    // 1. Buscar usuário SEM a coluna 'permissions' (que não existe mais)
+    const { data: usuario, error: userError } = await supabase
       .from('usuarios')
-      .select('*')
+      .select('id, name, email, role, created_at, cliente_id')
       .eq('id', userId)
       .single();
 
-    if (error) {
+    if (userError || !usuario) {
       return res.status(404).json({ error: 'Usuário não encontrado' });
     }
 
-    const { password, ...usuarioSemSenha } = data;
-    res.json({
-      ...usuarioSemSenha,
-      permissions: normalizePermissions(usuarioSemSenha.permissions)
-    });
+    // 2. Buscar permissões da tabela CORRETA
+    const { data: permissoes, error: permError } = await supabase
+      .from('permissoes_usuario')
+      .select('tela')
+      .eq('usuario_id', userId);
+
+    // 3. Montar permissions como array
+    const permissions = permissoes ? permissoes.map(p => p.tela) : [];
+
+    res.json({ ...usuario, permissions });
   } catch (error) {
-    console.error('Erro ao buscar usuário:', error);
-    res.status(500).json({ error: 'Erro interno' });
+    console.error('Erro ao carregar usuário:', error);
+    res.status(500).json({ error: 'Erro ao carregar usuário' });
   }
 });
 
-// ✅ NOVA: POST /users
+// ✅ POST /users — COM LOGS DETALHADOS (localhost)
 app.post('/users', async (req, res) => {
-  const { name, email, password, role, permissions = ['obras:read'] } = req.body;
+  console.log('\n=== 🚀 INICIANDO CRIAÇÃO DE USUÁRIO ===');
+  console.log('📥 Corpo da requisição:', req.body);
+  
+  const { name, email, password, role = 'user' } = req.body;
 
+  // Validação básica
   if (!name || !email || !password) {
+    console.log('❌ ERRO: Dados ausentes (name, email ou password)');
     return res.status(400).json({ error: 'Nome, e-mail e senha são obrigatórios' });
   }
+  console.log('✅ Dados básicos válidos');
 
   try {
-    // Verificar se e-mail já existe
+    // Verificar e-mail duplicado
+    console.log('🔍 Verificando se e-mail já existe:', email);
     const {  existing, error: checkError } = await supabase
       .from('usuarios')
       .select('id')
       .eq('email', email)
       .single();
 
-    if (!checkError && existing) {
-      return res.status(400).json({ error: 'E-mail já cadastrado' });
+    if (checkError && checkError.code !== 'PGRST116') {
+      console.error('💥 ERRO AO VERIFICAR E-MAIL:', checkError);
+      return res.status(500).json({ error: 'Erro ao verificar e-mail' });
     }
 
+    if (existing) {
+      console.log('❌ E-mail já cadastrado');
+      return res.status(400).json({ error: 'E-mail já cadastrado' });
+    }
+    console.log('✅ E-mail disponível');
+
+    // Criptografar senha
+    console.log('🔑 Criptografando senha...');
     const hashedPassword = await bcrypt.hash(password, 10);
+    console.log('✅ Senha criptografada');
+
+    // Inserir usuário
+    console.log('💾 Inserindo usuário no banco...');
+    const userData = {
+      name,
+      email,
+      password: hashedPassword,
+      role,
+      cliente_id: 'default',
+      created_at: new Date().toISOString()
+    };
+    console.log('📊 Dados a serem inseridos:', userData);
 
     const { data, error } = await supabase
       .from('usuarios')
-      .insert([{
-        name,
-        email,
-        password: hashedPassword,
-        role: role || 'user',
-        permissions: Array.isArray(permissions) ? permissions : ['obras:read']
-      }])
-      .select();
+      .insert([userData])
+      .select('id, name, email, role, created_at, cliente_id');
 
     if (error) {
-      console.error('Erro ao criar usuário:', error);
-      return res.status(500).json({ error: 'Erro ao criar usuário' });
+      console.error('❌ ERRO DO SUPABASE AO INSERIR:', error);
+      return res.status(500).json({ error: 'Erro ao criar usuário no banco de dados' });
     }
 
-    const { password: _, ...usuarioSemSenha } = data[0];
-    res.status(201).json(usuarioSemSenha);
+    console.log('✅ Usuário criado com sucesso:', data[0]);
+    console.log('=== 🎉 CRIAÇÃO CONCLUÍDA ===\n');
+    res.status(201).json(data[0]);
   } catch (error) {
-    console.error('Erro interno ao criar usuário:', error);
-    res.status(500).json({ error: 'Erro interno' });
+    console.error('💥 ERRO INESPERADO:', error);
+    res.status(500).json({ error: 'Erro interno ao criar usuário' });
   }
 });
 
@@ -2079,19 +2129,20 @@ app.put('/users/:id', async (req, res) => {
       return res.status(400).json({ error: 'Nome e e-mail são obrigatórios' });
     }
 
-    const updateData = { name, email, role, permissions };
-
-    // ✅ Só criptografa se for uma senha em texto claro (não um hash)
-    if (password && password.length < 60) { // hashes bcrypt têm ~60 caracteres
+    // ✅ 1. Atualizar dados do usuário (SEM permissions)
+    const updateData = { name, email, role };
+    
+    // ✅ Só atualiza senha se for texto claro
+    if (password && password.length < 60) {
       updateData.password = await bcrypt.hash(password, 10);
     }
-    // Se password tiver 60+ chars, é um hash → ignora (não recriptografa)
+    // Se password tiver 60+ chars, é um hash → ignora
 
     const { data, error } = await supabase
       .from('usuarios')
       .update(updateData)
       .eq('id', userId)
-      .select();
+      .select('id, name, email, role, created_at, cliente_id');
 
     if (error) {
       console.error('Erro ao atualizar usuário:', error);
@@ -2102,12 +2153,36 @@ app.put('/users/:id', async (req, res) => {
       return res.status(404).json({ error: 'Usuário não encontrado' });
     }
 
-    // 🔒 Remover senha da resposta
-    const { password: _, ...usuarioSemSenha } = data[0];
-    res.json(usuarioSemSenha);
+    // ✅ 2. Atualizar permissões (se fornecidas)
+    if (Array.isArray(permissions)) {
+      // Deletar permissões antigas
+      await supabase
+        .from('permissoes_usuario')
+        .delete()
+        .eq('usuario_id', userId);
+
+      // Inserir novas permissões
+      if (permissions.length > 0) {
+        const novasPermissoes = permissions.map(tela => ({
+          usuario_id: userId,
+          tela,
+          acao: 'visualizar'
+        }));
+        const { error: permError } = await supabase
+          .from('permissoes_usuario')
+          .insert(novasPermissoes);
+        if (permError) {
+          console.error('Erro ao inserir permissões:', permError);
+          throw permError;
+        }
+      }
+    }
+
+    // ✅ Responder com o usuário SEM senha
+    res.json(data[0]);
   } catch (error) {
     console.error('Erro ao atualizar usuário:', error);
-    res.status(500).json({ error: 'Erro interno' });
+    res.status(500).json({ error: 'Erro interno ao atualizar usuário' });
   }
 });
 
@@ -2419,24 +2494,70 @@ app.post('/orcamentos', async (req, res) => {
 
     console.log('✅ Orçamento criado com ID:', orcamento.id);
 
-    // ✅ IMPORTAÇÃO: usar os códigos da planilha, NÃO gerar novos
+    // ✅ GERAÇÃO DE CÓDIGOS: versão segura para grandes orçamentos
 let ordem = 0;
-const itensParaInserir = itens
-  .filter(item => item.nivel && item.descricao) // remove linhas vazias
-  .map(item => {
-    ordem++;
-    return {
-      orcamento_id: orcamento.id,
-      nivel: item.nivel,
-      codigo: item.codigo?.trim() || '', // ← usa o código da planilha
-      descricao: item.descricao,
-      unidade: item.nivel === 'servico' ? (item.unidade || null) : null,
-      quantidade: item.nivel === 'servico' ? (parseFloat(item.quantidade) || 0) : null,
-      valor_unitario_material: item.nivel === 'servico' ? (parseFloat(item.valor_unitario_material) || 0) : null,
-      valor_unitario_mao_obra: item.nivel === 'servico' ? (parseFloat(item.valor_unitario_mao_obra) || 0) : null,
-      ordem
-    };
+const itensParaInserir = [];
+let contadorLocal = 0;
+let contadorEtapa = 0;
+let contadorSubetapa = 0;
+let ultimoNivel = null; // rastreia o nível anterior
+
+for (const item of itens) {
+  if (!item.nivel || !item.descricao) continue;
+  ordem++;
+
+  let codigo = '';
+
+  if (item.nivel === 'local') {
+    contadorLocal++;
+    contadorEtapa = 0;
+    contadorSubetapa = 0;
+    ultimoNivel = 'local';
+    codigo = String(contadorLocal).padStart(2, '0');
+
+  } else if (item.nivel === 'etapa') {
+    if (ultimoNivel === 'local' || ultimoNivel === 'etapa') {
+      contadorEtapa++;
+    } else {
+      contadorEtapa = 1;
+    }
+    contadorSubetapa = 0;
+    ultimoNivel = 'etapa';
+    codigo = `${String(contadorLocal).padStart(2, '0')}.${String(contadorEtapa).padStart(2, '0')}`;
+
+  } else if (item.nivel === 'subetapa') {
+    if (ultimoNivel === 'etapa' || ultimoNivel === 'subetapa') {
+      contadorSubetapa++;
+    } else {
+      contadorSubetapa = 1;
+    }
+    ultimoNivel = 'subetapa';
+    codigo = `${String(contadorLocal).padStart(2, '0')}.${String(contadorEtapa).padStart(2, '0')}.${String(contadorSubetapa).padStart(2, '0')}`;
+
+  } else if (item.nivel === 'servico') {
+    // Gera sequência de serviço dentro da subetapa atual
+    const servicoSeq = itensParaInserir
+      .filter(i => 
+        i.codigo.startsWith(
+          `${String(contadorLocal).padStart(2, '0')}.${String(contadorEtapa).padStart(2, '0')}.${String(contadorSubetapa).padStart(2, '0')}`
+        ) && i.nivel === 'servico'
+      ).length + 1;
+    ultimoNivel = 'servico';
+    codigo = `${String(contadorLocal).padStart(2, '0')}.${String(contadorEtapa).padStart(2, '0')}.${String(contadorSubetapa).padStart(2, '0')}.${String(servicoSeq).padStart(2, '0')}`;
+  }
+
+  itensParaInserir.push({
+    orcamento_id: orcamento.id,
+    nivel: item.nivel,
+    codigo,
+    descricao: item.descricao,
+    unidade: item.nivel === 'servico' ? (item.unidade || null) : null,
+    quantidade: item.nivel === 'servico' ? (parseFloat(item.quantidade) || 0) : null,
+    valor_unitario_material: item.nivel === 'servico' ? (parseFloat(item.valor_unitario_material) || 0) : null,
+    valor_unitario_mao_obra: item.nivel === 'servico' ? (parseFloat(item.valor_unitario_mao_obra) || 0) : null,
+    ordem
   });
+}
     
 
     console.log('📤 Enviando', itensParaInserir.length, 'itens para inserção');
@@ -4539,13 +4660,8 @@ app.get('/relatorios/financeiro-consolidado', async (req, res) => {
   }
 });
 
-// GET /relatorios/obra/:obraId/realizado-por-item — COM ADM
-app.get('/relatorios/obra/:obraId/realizado-por-item', async (req, res) => {
-  const { obraId } = req.params;
-  const obraIdNum = parseInt(obraId, 10);
-  if (isNaN(obraIdNum)) {
-    return res.status(400).json({ error: 'ID da obra inválido' });
-  }
+// Função reutilizável: calcular realizado por item (inclui ADM)
+async function calcularRealizadoPorItem(obraIdNum) {
   try {
     // 1. Buscar orçamento ativo da obra para obter % de ADM
     const { data: orcamento } = await supabase
@@ -4567,7 +4683,7 @@ app.get('/relatorios/obra/:obraId/realizado-por-item', async (req, res) => {
       .eq('status', 'pago');
     if (notasError) throw notasError;
     if (!notas || notas.length === 0) {
-      return res.json(temADM ? [{ orcamento_item_id: 'ADM', valor_realizado: '0.00' }] : []);
+      return temADM ? [{ orcamento_item_id: 'ADM', valor_realizado: '0.00' }] : [];
     }
 
     let valorTotalOrcado = 0;
@@ -4640,382 +4756,28 @@ app.get('/relatorios/obra/:obraId/realizado-por-item', async (req, res) => {
       });
     }
 
-    res.json(resultado);
+    return resultado;
   } catch (error) {
-    console.error('Erro em /realizado-por-item (com ADM):', error);
-    res.status(500).json({ error: 'Erro ao carregar realizado por item' });
+    console.error('Erro em calcularRealizadoPorItem:', error);
+    throw error;
   }
-});
+}
 
-// PDF: GET /relatorios/obra/:obraId/orcado-x-realizado/pdf
-app.get('/relatorios/obra/:obraId/orcado-x-realizado/pdf', async (req, res) => {
+// Rota pública: /relatorios/obra/:obraId/realizado-por-item
+app.get('/relatorios/obra/:obraId/realizado-por-item', async (req, res) => {
   const { obraId } = req.params;
   const obraIdNum = parseInt(obraId, 10);
-  if (isNaN(obraIdNum)) return res.status(400).json({ error: 'ID inválido' });
-
-  let browser;
+  if (isNaN(obraIdNum)) {
+    return res.status(400).json({ error: 'ID da obra inválido' });
+  }
   try {
-    // === LOGO BASE64 ===
-    const LOGO_BASE64 = 'data:image/png;base64,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'
-
-    // 1. Buscar o orçamento MAIS RECENTE da obra (por obra_id)
-    const { data: orcamento } = await supabase
-      .from('orcamentos')
-      .select('id, obra_id, data_base, taxa_administracao, valor_total')
-      .eq('obra_id', obraIdNum) // ✅ CORRETO: filtra por obra_id
-      .order('created_at', { ascending: false })
-      .limit(1)
-      .single();
-      
-    if (!orcamento) {
-      return res.status(404).json({ error: 'Orçamento não encontrado para esta obra' });
-    }
-
-    // 2. Buscar obra
-    const { data: obra } = await supabase
-      .from('obras')
-      .select('nome, proprietario, endereco')
-      .eq('id', obraIdNum)
-      .single();
-
-    // 3. Buscar ITENS do orçamento
-    const { data: itensOrcamento } = await supabase
-      .from('itens_orcamento')
-      .select('id, nivel, codigo, descricao, unidade, quantidade, valor_unitario_material, valor_unitario_mao_obra, ordem')
-      .eq('orcamento_id', orcamento.id)
-      .order('ordem', { ascending: true });
-
-    // Calcular totais
-    const itensComTotais = itensOrcamento.map(item => {
-      const qtd = item.quantidade || 0;
-      const mat = item.valor_unitario_material || 0;
-      const mao = item.valor_unitario_mao_obra || 0;
-      return {
-        ...item,
-        total_material: qtd * mat,
-        total_mao_obra: qtd * mao,
-        total_item: qtd * (mat + mao)
-      };
-    });
-
-        // 4. Buscar valor REALIZADO por item (reutiliza a rota do frontend)
-    const { data: realizadoRaw } = await axios.get(
-      `http://localhost:3001/relatorios/obra/${obraIdNum}/realizado-por-item`
-    );
-
-    const realizadoMap = new Map();
-    realizadoRaw.forEach(item => {
-      realizadoMap.set(item.orcamento_item_id, parseFloat(item.valor_realizado) || 0);
-    });
-    // Combinar
-    const itensComRealizado = itensComTotais.map(item => ({
-      ...item,
-      realizado: realizadoMap.get(item.id) || 0
-    }));
-
-    const dataBase = orcamento.data_base ? new Date(orcamento.data_base).toLocaleDateString('pt-BR') : '—';
-
-    const html = `
-      <!DOCTYPE html>
-      <html>
-      <head>
-        <meta charset="utf-8">
-        <title>Orçado x Realizado - Obra ${obra?.nome || '—'}</title>
-        <style>
-  body {
-    font-family: Arial, sans-serif;
-    font-size: 7pt;
-    margin: 0;
-    padding: 0;
-    line-height: 1.2;
-  }
-  .container {
-    width: 210mm;
-    margin: 0 auto;
-    padding: 10mm;
-    box-sizing: border-box;
-  }
-  .header {
-    display: flex;
-    align-items: flex-start;
-    gap: 12px;
-    margin-bottom: 15px;
-    border-bottom: 2px solid #1e3a8a;
-    padding-bottom: 10px;
-  }
-  .header img {
-    height: 35px;
-    width: auto;
-    max-width: 140px;
-    object-fit: contain;
-  }
-  .header-info h1 {
-    font-size: 12pt;
-    color: #1e3a8a;
-    margin: 0 0 4px 0;
-  }
-  .header-info p {
-    font-size: 8pt;
-    margin: 0;
-    color: #4b5563;
-  }
-  .obra-info {
-    margin-bottom: 12px;
-    font-size: 7.5pt;
-  }
-  table {
-    width: 100%;
-    border-collapse: collapse;
-    margin-top: 10px;
-    /* ✅ REMOVIDO: table-layout: fixed → deixa o navegador ajustar as colunas automaticamente */
-  }
-  th, td {
-    border: 1px solid #ccc;
-    padding: 3px 6px; /* ✅ padding ligeiramente aumentado para respirar */
-    vertical-align: top;
-    text-align: left;
-    overflow: hidden;
-    word-wrap: break-word;
-    font-size: 7pt;
-  }
-  th {
-    background-color: #f1f5f9;
-    font-weight: bold;
-    text-align: center;
-  }
-  .totals {
-    margin-top: 15px;
-    font-size: 7.5pt;
-  }
-  .totals div {
-    margin: 4px 0;
-  }
-</style>
-      </head>
-      <body>
-        <div class="container">
-          <div class="header">
-            <div class="logo-section">
-              <img src="${LOGO_BASE64}" alt="Logo da Empresa">
-            </div>
-            <div class="title-section">
-              <h1>ERP MINHAS OBRAS</h1>
-              <p>RELATÓRIO ORÇADO X REALIZADO</p>
-            </div>
-          </div>
-          <div class="obra-info">
-            <strong>Obra:</strong> ${obra?.nome || '—'}<br>
-            <strong>Cliente:</strong> ${obra?.proprietario || '—'}<br>
-            <strong>Endereço:</strong> ${obra?.endereco || '—'}<br>
-            <strong>Data Base:</strong> ${dataBase}
-          </div>
-          <table>
-            <thead>
-              <tr>
-                <th>Cód.</th>
-                <th>Descrição</th>
-                <th>Und</th>
-                <th>Qtd</th>
-                <th>R$ Unit. Mat.</th>
-                <th>R$ Unit. Mão Obra</th>
-                <th>R$ Orçado Total</th>
-                <th>R$ Realizado</th>
-                <th>% Executado</th>
-              </tr>
-            </thead>
-            <tbody>
-              ${itensComRealizado.map(item => {
-                const indent = item.nivel === 'local' ? 0 :
-                               item.nivel === 'etapa' ? 10 :
-                               item.nivel === 'subetapa' ? 20 : 30;
-                const isServico = item.nivel === 'servico';
-                const percentual = item.total_item > 0 ? ((item.realizado / item.total_item) * 100) : 0;
-
-                return `
-                  <tr>
-                    <td style="padding-left: ${indent}px; font-weight: ${item.nivel === 'local' ? 'bold' : 'normal'};">${item.codigo}</td>
-                    <td style="font-weight: ${item.nivel === 'local' ? 'bold' : 'normal'};">${item.descricao}</td>
-                    <td>${isServico ? (item.unidade || '—') : ''}</td>
-                    <td style="text-align: right;">${isServico ? parseFloat(item.quantidade).toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 4 }) : ''}</td>
-                    <td style="text-align: right;">${isServico ? parseFloat(item.valor_unitario_material).toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' }) : ''}</td>
-                    <td style="text-align: right;">${isServico ? parseFloat(item.valor_unitario_mao_obra).toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' }) : ''}</td>
-                    <td style="text-align: right; font-weight: ${item.nivel === 'local' ? 'bold' : 'normal'};">${parseFloat(item.total_item).toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' })}</td>
-                    <td style="text-align: right; font-weight: bold; color: #1E40AF;">${parseFloat(item.realizado).toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' })}</td>
-                    <td style="text-align: right;">${item.total_item > 0 ? percentual.toFixed(1) + '%' : '—'}</td>
-                  </tr>
-                `;
-              }).join('')}
-            </tbody>
-          </table>
-        </div>
-      </body>
-      </html>
-    `;
-
-    browser = await puppeteer.launch({ headless: true });
-    const page = await browser.newPage();
-    await page.setContent(html, { waitUntil: 'networkidle0', timeout: 30000 });
-    const pdfBuffer = await page.pdf({ format: 'A4', printBackground: true });
-    await browser.close();
-
-    res.setHeader('Content-Type', 'application/pdf');
-    res.setHeader('Content-Disposition', `inline; filename=orcado-x-realizado-obra-${obraIdNum}.pdf`);
-    res.end(pdfBuffer);
-
+    const resultado = await calcularRealizadoPorItem(obraIdNum);
+    res.json(resultado);
   } catch (error) {
-    console.error('❌ Erro ao gerar PDF Orçado x Realizado:', error);
-    if (browser) await browser.close().catch(() => {});
-    if (!res.headersSent) {
-      res.status(500).json({ error: 'Erro ao gerar PDF' });
-    }
+    console.error('Erro ao carregar realizado por item:', error);
+    res.status(500).json({ error: 'Erro ao carregar realizado por item' });
   }
-});
-
-// EXCEL: GET /relatorios/obra/:id/orcado-x-realizado/excel
-app.get('/relatorios/obra/:id/orcado-x-realizado/excel', requirePermission('relatorios.acessar', true), async (req, res) => {
-  const obraIdNum = parseInt(req.params.id, 10);
-  if (isNaN(obraIdNum)) return res.status(400).json({ error: 'ID inválido' });
-
-  try {
-    // 1. Buscar o ORÇAMENTO MAIS RECENTE da OBRA
-    const { data: orcamentos, error: orcError } = await supabase
-      .from('orcamentos')
-      .select('id')
-      .eq('obra_id', obraIdNum)
-      .order('created_at', { ascending: false })
-      .limit(1);
-
-    if (orcError || !orcamentos || orcamentos.length === 0) {
-      return res.status(404).json({ error: 'Orçamento não encontrado para esta obra' });
-    }
-
-    const orcamentoId = orcamentos[0].id;
-
-    // 2. Buscar ITENS do orçamento
-    const { data: itensOrcamento, error: itensError } = await supabase
-      .from('itens_orcamento')
-      .select('*')
-      .eq('orcamento_id', orcamentoId)
-      .order('ordem', { ascending: true });
-
-    if (itensError) throw itensError;
-
-    // 3. Buscar valor REALIZADO por item
-    const { data: realizadoRaw } = await axios.get(
-      `http://localhost:3001/relatorios/obra/${obraIdNum}/realizado-por-item`,
-      { headers: { 'X-User-ID': req.headers['x-user-id'] } }
-    );
-
-    const realizadoMap = new Map();
-    realizadoRaw.forEach(item => {
-      realizadoMap.set(item.orcamento_item_id, parseFloat(item.valor_realizado) || 0);
-    });
-
-    // 4. Combinar dados
-    const itensComRealizado = itensOrcamento.map(item => ({
-      ...item,
-      realizado: realizadoMap.get(item.id) || 0,
-      total_item: (parseFloat(item.quantidade) * (parseFloat(item.valor_unitario_material || 0) + parseFloat(item.valor_unitario_mao_obra || 0))) || 0,
-      quantidade: item.quantidade ? parseFloat(item.quantidade) : null,
-      valor_unitario_material: item.valor_unitario_material ? parseFloat(item.valor_unitario_material) : null,
-      valor_unitario_mao_obra: item.valor_unitario_mao_obra ? parseFloat(item.valor_unitario_mao_obra) : null,
-    }));
-
-    // 5. Criar Excel
-    const workbook = new ExcelJS.Workbook();
-    const worksheet = workbook.addWorksheet('Orçado x Realizado');
-
-    // Estilo de borda fina (completa em todos os lados)
-    const thinBorder = {
-      top: { style: 'thin' },
-      left: { style: 'thin' },
-      bottom: { style: 'thin' },
-      right: { style: 'thin' }
-    };
-
-    // Estilo do cabeçalho: fundo azul escuro (#1E3A8A), fonte branca
-    const headerStyle = {
-      font: { bold: true, color: { argb: 'FFFFFFFF' } },
-      fill: { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1E3A8A' } },
-      alignment: { horizontal: 'center' },
-      border: thinBorder
-    };
-
-    // Cabeçalho
-    const headerRow = worksheet.addRow([
-      'Código', 'Descrição', 'Und', 'Qtd', 'Vlr Unit. Mat.',
-      'Vlr Unit. Mão Obra', 'Orçado Total', 'Realizado', '% Executado'
-    ]);
-    headerRow.eachCell(cell => {
-      Object.assign(cell, headerStyle);
-    });
-
-    // Dados
-    itensComRealizado.forEach(item => {
-      const isServico = item.nivel === 'servico';
-      const isBold = !isServico;
-      const percentual = item.total_item > 0 ? (item.realizado / item.total_item) : null;
-
-      const row = worksheet.addRow([
-        item.codigo || '',
-        item.descricao || '',
-        isServico ? (item.unidade || '') : '',
-        isServico ? item.quantidade : '',
-        isServico ? item.valor_unitario_material : '',
-        isServico ? item.valor_unitario_mao_obra : '',
-        item.total_item || 0,
-        item.realizado || 0,
-        percentual
-      ]);
-
-      // ✅ APLICAR BORDA FINA EM TODAS AS CÉLULAS (mesmo vazias)
-      row.eachCell(cell => {
-        cell.border = thinBorder;
-      });
-
-      // Estilo negrito para Locais, Etapas, Subetapas
-      if (isBold) {
-        row.eachCell(cell => {
-          if (!cell.style.font) cell.style.font = {};
-          cell.style.font.bold = true;
-        });
-      }
-
-      // Formatação monetária (colunas 5 a 8)
-      [5, 6, 7, 8].forEach(colIndex => {
-        const cell = row.getCell(colIndex);
-        if (cell.value != null && cell.value !== '') {
-          cell.numFmt = 'R$ #,##0.00';
-          cell.alignment = { horizontal: 'right' };
-        }
-      });
-
-      // Formatação percentual (coluna 9)
-      const pctCell = row.getCell(9);
-      if (pctCell.value != null && pctCell.value !== '') {
-        pctCell.numFmt = '0.00%';
-        pctCell.alignment = { horizontal: 'right' };
-      }
-    });
-
-    // Ajustar largura das colunas
-    const colWidths = [14, 35, 8, 10, 15, 18, 15, 15, 14];
-    colWidths.forEach((width, i) => {
-      worksheet.getColumn(i + 1).width = width;
-    });
-
-    // Enviar arquivo
-    const buffer = await workbook.xlsx.writeBuffer();
-    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-    res.setHeader('Content-Disposition', `attachment; filename=orcado-x-realizado-obra-${obraIdNum}.xlsx`);
-    res.send(Buffer.from(buffer));
-  } catch (error) {
-    console.error('❌ Erro ao gerar Excel Orçado x Realizado:', error);
-    if (!res.headersSent) {
-      res.status(500).json({ error: 'Erro interno ao gerar relatório Excel' });
-    }
-  }
-});
+}); 
 
 console.log('🚀 SERVIDOR PERSONALIZADO DO ERP MINHAS OBRAS INICIADO!');
 
