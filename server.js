@@ -3558,7 +3558,7 @@ const formatarDataParaLocal = (dataISO) => {
 // GET /notas-fiscais/excel — Exportar lista completa de notas fiscais para Excel
 app.get('/notas-fiscais/excel', async (req, res) => {
   try {
-    // 1. Buscar notas fiscais com filtros
+    // 1. Buscar notas fiscais com filtros (INCLUINDO os novos campos)
     let query = supabase
       .from('notas_fiscais')
       .select(`
@@ -3626,7 +3626,7 @@ app.get('/notas-fiscais/excel', async (req, res) => {
       alignment: { horizontal: 'right' }
     };
     
-    // 5. Cabeçalho com NOVAS COLUNAS
+    // 5. Cabeçalho COM AS NOVAS COLUNAS
     const columns = [
       'NF',
       'Obra',
@@ -3638,7 +3638,7 @@ app.get('/notas-fiscais/excel', async (req, res) => {
       'Valor Pago',
       'Desconto',
       'Juros',
-      'Imp. Retidos',  // ✅ NOVA COLUNA
+      'Imp. Retidos',
       'Status',
       'Usuário Lançamento',
       'Usuário Baixa'
@@ -3649,7 +3649,7 @@ app.get('/notas-fiscais/excel', async (req, res) => {
       Object.assign(cell.style, headerStyle);
     });
     
-    // 6. Preencher dados COM A MESMA LÓGICA DO PDF
+    // 6. Preencher dados COM AS NOVAS COLUNAS
     listaNotas.forEach(nota => {
       const row = worksheet.addRow([
         nota.numero_nota || '—',
@@ -3662,7 +3662,7 @@ app.get('/notas-fiscais/excel', async (req, res) => {
         nota.valor_pago || nota.valor_total || 0,
         nota.desconto || 0,
         nota.juros || 0,
-        // ✅ CONDIÇÃO: só exibe impostos_retidos se status === 'pago'
+        // ✅ CONDIÇÃO: só exibe impostos_retidos se status === 'pago' (mesma lógica do PDF)
         nota.status === 'pago' ? (nota.impostos_retidos || 0) : null,
         nota.status || '—',
         nota.usuario_lancamento || '—',
@@ -3678,7 +3678,7 @@ app.get('/notas-fiscais/excel', async (req, res) => {
       });
     });
     
-    // 7. Ajustar largura das colunas
+    // 7. Ajustar largura das colunas (14 colunas agora)
     worksheet.getColumn(1).width = 12;   // NF
     worksheet.getColumn(2).width = 25;   // Obra
     worksheet.getColumn(3).width = 25;   // Fornecedor
