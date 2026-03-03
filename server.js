@@ -3558,7 +3558,7 @@ const formatarDataParaLocal = (dataISO) => {
 // GET /notas-fiscais/excel — Exportar lista completa de notas fiscais para Excel
 app.get('/notas-fiscais/excel', async (req, res) => {
   try {
-    // 1. Buscar notas fiscais com filtros (igual ao PDF)
+    // 1. Buscar notas fiscais com filtros
     let query = supabase
       .from('notas_fiscais')
       .select(`
@@ -3568,6 +3568,9 @@ app.get('/notas-fiscais/excel', async (req, res) => {
         data_pagamento,
         forma_pagamento,
         frete,
+        desconto,
+        juros,
+        impostos_retidos,
         valor_total,
         valor_pago,
         status,
@@ -3579,51 +3582,51 @@ app.get('/notas-fiscais/excel', async (req, res) => {
         fornecedores (nome_fantasia)
       `)
       .order('data_emissao', { ascending: false });
-
+    
     if (req.query.obra_id) {
       query = query.eq('obra_id', req.query.obra_id);
     }
-
+    
     const { data: notas, error } = await query;
     if (error) throw error;
-
+    
     const listaNotas = Array.isArray(notas) ? notas : [];
-
-    // 2. Buscar obras e fornecedores em lote (se ainda não estiverem no .select com !inner)
+    
+    // 2. Buscar obras e fornecedores em lote
     const obraIds = [...new Set(listaNotas.map(n => n.obra_id))];
     const fornecedorIds = [...new Set(listaNotas.map(n => n.fornecedor_id))];
-
+    
     const [obrasRes, fornecedoresRes] = await Promise.all([
       supabase.from('obras').select('id, nome').in('id', obraIds),
       supabase.from('fornecedores').select('id, nome_fantasia').in('id', fornecedorIds)
     ]);
-
+    
     const obrasMap = (obrasRes.data || []).reduce((acc, o) => ({ ...acc, [o.id]: o.nome }), {});
     const fornecedoresMap = (fornecedoresRes.data || []).reduce((acc, f) => ({ ...acc, [f.id]: f.nome_fantasia }), {});
-
+    
     // 3. Criar workbook Excel
     const ExcelJS = require('exceljs');
     const workbook = new ExcelJS.Workbook();
     const worksheet = workbook.addWorksheet('Notas Fiscais');
-
+    
     // 4. Estilos
     const headerStyle = {
-      font: { bold: true, color: { argb: 'FFFFFFFF' }, size: 11 },
+      font: { bold: true, color: { argb: 'FFFFFFFF' }, size: 10 },
       fill: { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1E3A8A' } },
       alignment: { horizontal: 'center', vertical: 'middle', wrapText: true },
       border: { top: { style: 'thin' }, left: { style: 'thin' }, bottom: { style: 'thin' }, right: { style: 'thin' } }
     };
-
+    
     const borderStyle = {
       border: { top: { style: 'thin' }, left: { style: 'thin' }, bottom: { style: 'thin' }, right: { style: 'thin' } }
     };
-
+    
     const moneyStyle = {
       numFmt: 'R$ #,##0.00',
       alignment: { horizontal: 'right' }
     };
-
-    // 5. Cabeçalho
+    
+    // 5. Cabeçalho com NOVAS COLUNAS
     const columns = [
       'NF',
       'Obra',
@@ -3633,17 +3636,20 @@ app.get('/notas-fiscais/excel', async (req, res) => {
       'Vencimento',
       'Valor Total',
       'Valor Pago',
+      'Desconto',
+      'Juros',
+      'Imp. Retidos',  // ✅ NOVA COLUNA
       'Status',
       'Usuário Lançamento',
       'Usuário Baixa'
     ];
-
+    
     const headerRow = worksheet.addRow(columns);
     headerRow.eachCell(cell => {
       Object.assign(cell.style, headerStyle);
     });
-
-    // 6. Preencher dados
+    
+    // 6. Preencher dados COM A MESMA LÓGICA DO PDF
     listaNotas.forEach(nota => {
       const row = worksheet.addRow([
         nota.numero_nota || '—',
@@ -3654,39 +3660,46 @@ app.get('/notas-fiscais/excel', async (req, res) => {
         nota.data_vencimento ? new Date(nota.data_vencimento).toLocaleDateString('pt-BR') : '—',
         nota.valor_total || 0,
         nota.valor_pago || nota.valor_total || 0,
+        nota.desconto || 0,
+        nota.juros || 0,
+        // ✅ CONDIÇÃO: só exibe impostos_retidos se status === 'pago'
+        nota.status === 'pago' ? (nota.impostos_retidos || 0) : null,
         nota.status || '—',
         nota.usuario_lancamento || '—',
         nota.usuario_baixa || '—'
       ]);
-
+      
       row.eachCell((cell, colNumber) => {
         Object.assign(cell.style, borderStyle);
-        // Aplicar estilo monetário nas colunas de valores (7 e 8)
-        if (colNumber === 7 || colNumber === 8) {
+        // Aplicar estilo monetário nas colunas de valores (7-11)
+        if ([7, 8, 9, 10, 11].includes(colNumber)) {
           Object.assign(cell.style, moneyStyle);
         }
       });
     });
-
+    
     // 7. Ajustar largura das colunas
-    worksheet.getColumn(1).width = 12;  // NF
-    worksheet.getColumn(2).width = 25;  // Obra
-    worksheet.getColumn(3).width = 25;  // Fornecedor
-    worksheet.getColumn(4).width = 12;  // Lançamento
-    worksheet.getColumn(5).width = 12;  // Emissão
-    worksheet.getColumn(6).width = 12;  // Vencimento
-    worksheet.getColumn(7).width = 14;  // Valor Total
-    worksheet.getColumn(8).width = 14;  // Valor Pago
-    worksheet.getColumn(9).width = 12;  // Status
-    worksheet.getColumn(10).width = 20; // Usuário Lançamento
-    worksheet.getColumn(11).width = 20; // Usuário Baixa
-
+    worksheet.getColumn(1).width = 12;   // NF
+    worksheet.getColumn(2).width = 25;   // Obra
+    worksheet.getColumn(3).width = 25;   // Fornecedor
+    worksheet.getColumn(4).width = 12;   // Lançamento
+    worksheet.getColumn(5).width = 12;   // Emissão
+    worksheet.getColumn(6).width = 12;   // Vencimento
+    worksheet.getColumn(7).width = 14;   // Valor Total
+    worksheet.getColumn(8).width = 14;   // Valor Pago
+    worksheet.getColumn(9).width = 12;   // Desconto
+    worksheet.getColumn(10).width = 12;  // Juros
+    worksheet.getColumn(11).width = 14;  // Imp. Retidos
+    worksheet.getColumn(12).width = 12;  // Status
+    worksheet.getColumn(13).width = 20;  // Usuário Lançamento
+    worksheet.getColumn(14).width = 20;  // Usuário Baixa
+    
     // 8. Gerar e enviar arquivo
     const buffer = await workbook.xlsx.writeBuffer();
     res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
     res.setHeader('Content-Disposition', `attachment; filename=notas-fiscais.xlsx`);
     res.send(Buffer.from(buffer));
-
+    
   } catch (error) {
     console.error('❌ Erro ao gerar Excel de notas fiscais:', error);
     if (!res.headersSent) {
