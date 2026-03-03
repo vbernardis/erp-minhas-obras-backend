@@ -3500,6 +3500,9 @@ app.get('/notas-fiscais', async (req, res) => {
         valor_total,
         valor_pago,
         status,
+        desconto,        
+        juros,           
+        impostos_retidos,
         obra_id,
         fornecedor_id,
         obras (nome),
@@ -4164,6 +4167,7 @@ app.put('/notas-fiscais/:id', async (req, res) => {
   const { id } = req.params;
   const notaId = parseInt(id, 10);
   if (isNaN(notaId)) return res.status(400).json({ error: 'ID inválido' });
+  
   const {
     obra_id,
     fornecedor_id,
@@ -4171,11 +4175,11 @@ app.put('/notas-fiscais/:id', async (req, res) => {
     data_emissao,
     data_vencimento,
     data_pagamento,
-    forma_pagamento, // Pode ser vazio
+    forma_pagamento,
     frete,
     valor_total,
-    status
-    // data_lancamento NÃO deve ser desestruturado aqui para atualização
+    status,
+    itens // ✅ Recebe os itens do frontend
   } = req.body;
 
   try {
@@ -4196,18 +4200,56 @@ app.put('/notas-fiscais/:id', async (req, res) => {
     if (forma_pagamento && forma_pagamento.trim() !== '') {
         updateObject.forma_pagamento = forma_pagamento;
     } else {
-        // Se o valor recebido for vazio, não atualiza o campo no banco
         console.log(`⚠️ forma_pagamento vazio recebido. Mantendo valor original no banco para nota ID ${notaId}.`);
     }
 
     // ✅ NUNCA atualiza data_lancamento ou usuario_baixa via edição
     // Eles são fixos no momento do lançamento ou baixa.
 
-    const { error } = await supabase
+    // 1. Atualizar dados principais da nota fiscal
+    const { error: updateError } = await supabase
       .from('notas_fiscais')
-      .update(updateObject) // <- Usando o objeto dinâmico
+      .update(updateObject)
       .eq('id', notaId);
-    if (error) throw error;
+    
+    if (updateError) throw updateError;
+
+    // ✅ 2. Atualizar os itens da nota fiscal (ADICIONADO)
+    if (Array.isArray(itens) && itens.length > 0) {
+      for (const item of itens) {
+        if (item.id && item.id !== 'new') {
+          // ✅ Item existente: UPDATE
+          await supabase
+            .from('itens_nota_fiscal')
+            .update({
+              descricao: item.descricao,
+              unidade: item.unidade || null,
+              quantidade: parseFloat(item.quantidade) || 0,
+              preco_unit: parseFloat(item.preco_unit) || 0,
+              imposto: parseFloat(item.imposto) || 0,
+              preco_total: parseFloat(item.preco_total) || 0,
+              orcamento_item_id: item.orcamento_item_id ? parseInt(item.orcamento_item_id) : null
+            })
+            .eq('id', item.id)
+            .eq('nota_fiscal_id', notaId);
+        } else {
+          // ✅ Novo item: INSERT
+          await supabase
+            .from('itens_nota_fiscal')
+            .insert([{
+              nota_fiscal_id: notaId,
+              descricao: item.descricao,
+              unidade: item.unidade || null,
+              quantidade: parseFloat(item.quantidade) || 0,
+              preco_unit: parseFloat(item.preco_unit) || 0,
+              imposto: parseFloat(item.imposto) || 0,
+              preco_total: parseFloat(item.preco_total) || 0,
+              orcamento_item_id: item.orcamento_item_id ? parseInt(item.orcamento_item_id) : null
+            }]);
+        }
+      }
+    }
+
     res.json({ id: notaId });
   } catch (error) {
     console.error('Erro ao atualizar nota fiscal:', error);
@@ -4317,6 +4359,7 @@ app.get('/notas-fiscais/pdf/lista', async (req, res) => {
         frete,
         valor_total,
         status,
+        impostos_retidos,
         obra_id,
         fornecedor_id,
         usuario_baixa,
