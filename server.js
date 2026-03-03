@@ -3950,10 +3950,14 @@ app.post('/notas-fiscais', upload.fields([
 app.post('/notas-fiscais/:id/baixa', async (req, res) => {
   const { id } = req.params;
   const notaId = parseInt(id, 10);
+  
+  // ✅ ADICIONADO: impostos_retidos e obs_impostos
   const { 
     data_pagamento, 
     juros = 0, 
     desconto = 0, 
+    impostos_retidos = 0,  // ← NOVO CAMPO
+    obs_impostos = '',     // ← NOVO CAMPO
     observacoes = '', 
     usuario_baixa 
   } = req.body;
@@ -3978,7 +3982,11 @@ app.post('/notas-fiscais/:id/baixa', async (req, res) => {
     const valorOriginal = parseFloat(nota.valor_total) || 0;
     const jurosNum = parseFloat(juros) || 0;
     const descontoNum = parseFloat(desconto) || 0;
-    const valorPago = valorOriginal + jurosNum - descontoNum;
+    // ✅ ADICIONADO: parse do novo campo
+    const impostosRetidosNum = parseFloat(impostos_retidos) || 0;
+    
+    // ✅ CÁLCULO ATUALIZADO: subtrai impostos_retidos
+    const valorPago = valorOriginal + jurosNum - descontoNum - impostosRetidosNum;
 
     if (valorPago <= 0) {
       return res.status(400).json({ error: 'Valor pago deve ser maior que zero' });
@@ -3991,6 +3999,9 @@ app.post('/notas-fiscais/:id/baixa', async (req, res) => {
         data_pagamento: data_pagamento,
         juros: jurosNum,
         desconto: descontoNum,
+        // ✅ ADICIONADOS: novos campos no update
+        impostos_retidos: impostosRetidosNum,
+        obs_impostos: obs_impostos,
         valor_pago: valorPago,
         status: 'pago',
         usuario_baixa: usuario_baixa,
