@@ -23,20 +23,109 @@ app.set('supabase', supabase);
 const ExcelJS = require('exceljs'); // ← Adicione esta linha no topo
 const nodemailer = require('nodemailer');
 const axios = require('axios');
+const checkPermission = require('./src/middleware/checkPermission');
 
-// ✅ Função para parsear valores monetários no formato brasileiro
-const parseValorBR = (valor) => {
-  if (valor === null || valor === undefined || valor === '') return 0;
-  if (typeof valor === 'number') return valor;
-  
-  // Remove pontos de milhar e troca vírgula por ponto
-  const limpo = valor.toString()
-    .replace(/\./g, '')      // Remove pontos de milhar: "3.000" → "3000"
-    .replace(',', '.');       // Troca vírgula decimal por ponto: "3000,50" → "3000.50"
-  
-  const parsed = parseFloat(limpo);
-  return isNaN(parsed) ? 0 : parsed;
-};
+// ==========
+// FUNÇÃO REUTILIZÁVEL: calcular realizado por item (sem depender de axios)
+// ==========
+async function calcularRealizadoPorItem(obraIdNum) {
+  try {
+    // 1. Buscar orçamento ativo da obra para obter % de ADM
+    const { data: orcamento } = await supabase
+      .from('orcamentos')
+      .select('id, taxa_administracao')
+      .eq('obra_id', obraIdNum)
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .single();
+
+    const taxaADM = orcamento ? parseFloat(orcamento.taxa_administracao) || 0 : 0;
+    const temADM = taxaADM > 0;
+
+    // 2. Buscar todas as notas PAGAS da obra (com valor_total, valor_pago e frete)
+    const { data: notas, error: notasError } = await supabase
+      .from('notas_fiscais')
+      .select('id, valor_total, valor_pago, frete')
+      .eq('obra_id', obraIdNum)
+      .eq('status', 'pago');
+    if (notasError) throw notasError;
+    if (!notas || notas.length === 0) {
+      return temADM ? [{ orcamento_item_id: 'ADM', valor_realizado: '0.00' }] : [];
+    }
+
+    let valorTotalOrcado = 0;
+    let valorADMRealizado = 0;
+    let realizadoPorItem = new Map();
+
+    // 3. Obter valor orçado total do orçamento (só serviços)
+    if (orcamento) {
+      const { data: itensOrc } = await supabase
+        .from('itens_orcamento')
+        .select('quantidade, valor_unitario_material, valor_unitario_mao_obra')
+        .eq('orcamento_id', orcamento.id)
+        .eq('nivel', 'servico');
+      valorTotalOrcado = itensOrc.reduce((sum, item) => {
+        const qtd = parseFloat(item.quantidade) || 0;
+        const mat = parseFloat(item.valor_unitario_material) || 0;
+        const mao = parseFloat(item.valor_unitario_mao_obra) || 0;
+        return sum + qtd * (mat + mao);
+      }, 0);
+    }
+
+    // 4. Processar cada nota
+    for (const nota of notas) {
+      const notaId = nota.id;
+      const valorTotalNota = parseFloat(nota.valor_total) || 0;
+      const valorPago = parseFloat(nota.valor_pago) || 0;
+      const frete = parseFloat(nota.frete) || 0;
+      if (valorTotalNota <= 0 || valorPago <= 0) continue;
+
+      const valorNotaSemFrete = valorTotalNota - frete;
+      if (temADM && valorTotalOrcado > 0) {
+        const proporcaoADMNaNota = valorNotaSemFrete / valorTotalOrcado;
+        const valorADMNota = (taxaADM / 100) * valorTotalOrcado * proporcaoADMNaNota;
+        valorADMRealizado += valorADMNota;
+      }
+
+      const { data: itens, error: itensError } = await supabase
+        .from('itens_nota_fiscal')
+        .select('orcamento_item_id, preco_total')
+        .eq('nota_fiscal_id', notaId)
+        .not('orcamento_item_id', 'is', null);
+      if (itensError || !itens) continue;
+
+      for (const item of itens) {
+        const precoItem = parseFloat(item.preco_total) || 0;
+        if (precoItem <= 0) continue;
+        const proporcao = precoItem / valorTotalNota;
+        const valorRealizado = valorPago * proporcao;
+        const idItem = item.orcamento_item_id;
+        const totalAtual = realizadoPorItem.get(idItem) || 0;
+        realizadoPorItem.set(idItem, totalAtual + valorRealizado);
+      }
+    }
+
+    // 5. Formatar resultado
+    const resultado = Array.from(realizadoPorItem.entries()).map(([id, valor]) => ({
+      orcamento_item_id: parseInt(id, 10),
+      valor_realizado: parseFloat(valor).toFixed(2)
+    }));
+
+    // 6. Adicionar linha de ADM se aplicável
+    if (temADM) {
+      resultado.push({
+        orcamento_item_id: 'ADM',
+        valor_realizado: valorADMRealizado.toFixed(2)
+      });
+    }
+
+    return resultado;
+  } catch (error) {
+    console.error('Erro em calcularRealizadoPorItem:', error);
+    throw error;
+  }
+}
+
 
 // Função para converter data no formato DD/MM/YYYY → YYYY-MM-DD
 function converterDataBRParaISO(dataBR) {
@@ -88,114 +177,6 @@ const carregarConfiguracaoEmpresa = async () => {
 
 app.use(cors({ origin: '*' }));
 app.use(express.json());
-
-// ==========================================
-// 🔐 SISTEMA AUTOMÁTICO DE PERMISSÕES - CORRIGIDO
-// ==========================================
-app.use(async (req, res, next) => {
-  // 1. Ignorar rotas públicas (Login e Listagens simples GET)
-  const rotasPublicas = [
-    '/login', '/fornecedores', '/pedidos-compra', '/diarios-obras',
-    '/notas-fiscais', '/orcamentos', '/obras', '/users/change-password',
-    '/users/reset-password', '/users/forgot-password', '/users'  // ← Adicionado /users
-  ];
-  
-  // Se for GET e estiver na lista pública, libera
-  if (req.method === 'GET' && rotasPublicas.some(r => req.path.startsWith(r))) {
-    return next();
-  }
-  
-  // 2. Pegar ID do usuário enviado pelo Frontend
-  const userId = req.headers['x-user-id'];
-  if (!userId) return next();
-  
-  // 3. ✅ VERIFICAR MASTER IMEDIATAMENTE (antes de qualquer outra lógica)
-  try {
-    const { data: user, error: userError } = await supabase
-      .from('usuarios')
-      .select('role')
-      .eq('id', parseInt(userId, 10))
-      .single();
-    
-    if (userError) {
-      console.warn('⚠️ Erro ao buscar usuário:', userError);
-      return next();
-    }
-    
-    // ✅ Se for MASTER, libera TUDO imediatamente
-    if (user?.role === 'master') {
-      console.log(`✅ [MASTER] Usuário ${userId} liberado para ${req.method} ${req.path}`);
-      return next();
-    }
-  } catch (err) {
-    console.error('❌ Erro ao verificar usuário master:', err);
-    return next(); // Não bloqueia em caso de erro
-  }
-  
-  // 4. Mapeamento de Rotas Perigosas e suas Permissões Necessárias
-  const mapaPermissoes = {
-    // Obras
-    'POST /obras': 'obras:criar',
-    'PUT /obras/': 'obras:editar',
-    'DELETE /obras/': 'obras:excluir',
-    // Orçamentos
-    'POST /orcamentos': 'orcamentos:criar',
-    'PUT /orcamentos/': 'orcamentos:editar',
-    'DELETE /orcamentos/': 'orcamentos:editar',
-    // Diário
-    'POST /diarios-obras': 'diario:criar',
-    'PUT /diarios-obras/': 'diario:editar',
-    'DELETE /diarios-obras/': 'diario:excluir',
-    // Financeiro
-    'POST /notas-fiscais': 'financeiro:notas:lancar',
-    'PUT /notas-fiscais/': 'financeiro:notas:editar',
-    'DELETE /notas-fiscais/': 'financeiro:notas:excluir',
-    // Suprimentos
-    'POST /fornecedores': 'suprimentos:fornecedores',
-    'PUT /fornecedores/': 'suprimentos:fornecedores',
-    'DELETE /fornecedores/': 'suprimentos:fornecedores',
-    'POST /pedidos-compra': 'suprimentos:pedidos',
-    'PUT /pedidos-compra/': 'suprimentos:pedidos',
-    'DELETE /pedidos-compra/': 'suprimentos:pedidos',
-    // Usuários
-    'POST /users': 'usuarios:gerenciar',
-    'PUT /users/': 'usuarios:gerenciar',
-    'DELETE /users/': 'usuarios:gerenciar'
-  };
-  
-  // 5. Verificar se a rota atual precisa de permissão
-  const permissaoNecessaria = mapaPermissoes[`${req.method} ${req.path}`] ||
-    Object.entries(mapaPermissoes).find(([key]) =>
-      `${req.method} ${req.path}`.startsWith(key.replace(/\/$/, ''))
-    )?.[1];
-  
-  if (permissaoNecessaria) {
-    try {
-      // Buscar permissões do usuário (já sabemos que NÃO é master)
-      const { data: perms } = await supabase
-        .from('permissoes_usuario')
-        .select('tela')
-        .eq('usuario_id', parseInt(userId, 10));
-      
-      const permissoesUsuario = perms ? perms.map(p => p.tela) : [];
-      
-      // Verificar se tem a permissão necessária
-      if (!permissoesUsuario.includes(permissaoNecessaria)) {
-        console.warn(`🚫 BLOQUEADO: Usuário ${userId} tentou ${req.method} ${req.path} sem permissão ${permissaoNecessaria}`);
-        return res.status(403).json({ 
-          error: 'Acesso negado: você não tem permissão para esta ação.',
-          required: permissaoNecessaria,
-          userPermissions: permissoesUsuario
-        });
-      }
-    } catch (err) {
-      console.error('Erro ao verificar permissão:', err);
-    }
-  }
-  
-  next();
-});
-// ==========================================
 
 const multer = require('multer');
 const upload = multer({ storage: multer.memoryStorage() });
@@ -287,7 +268,7 @@ app.get('/obras/:id', async (req, res) => {
 });
 
 // POST /obras — Criar nova obra
-app.post('/obras', async (req, res) => {
+app.post('/obras', checkPermission, async (req, res) => {
   try {
     const {
       nome,
@@ -938,49 +919,45 @@ const generateToken = () => crypto.randomBytes(32).toString('hex');
 // ROTAS DE USUÁRIOS — CRUD COMPLETO
 // ========================
 
-// GET /users — Listar usuários COM permissões
+// GET /users — Listar todos os usuários com permissões
 app.get('/users', async (req, res) => {
   try {
-    console.log('🔍 Buscando usuários...');
-    
-    // 1. Buscar usuários básicos
+    // 1. Buscar usuários
     const { data: usuarios, error } = await supabase
       .from('usuarios')
       .select('id, name, email, role, created_at, cliente_id');
-    
+
     if (error) {
-      console.error('Erro Supabase:', error);
+      console.error('Erro ao buscar usuários:', error);
       return res.status(500).json({ error: 'Erro ao buscar usuários' });
     }
-    
-    // 2. Buscar TODAS as permissões de uma vez (mais eficiente)
+
+    // 2. Buscar todas as permissões
     const { data: todasPermissoes, error: permError } = await supabase
       .from('permissoes_usuario')
       .select('usuario_id, tela');
-    
+
     if (permError) {
-      console.warn('⚠️ Erro ao carregar permissões:', permError);
+      console.warn('Erro ao carregar permissões:', permError);
     }
-    
-    // 3. Agrupar permissões por usuário_id
+
+    // 3. Mapear permissões por usuário
     const permissoesPorUsuario = (todasPermissoes || []).reduce((acc, p) => {
       if (!acc[p.usuario_id]) acc[p.usuario_id] = [];
       acc[p.usuario_id].push(p.tela);
       return acc;
     }, {});
-    
-    // 4. Adicionar array de permissões a cada usuário
+
+    // 4. Adicionar permissões a cada usuário
     const usuariosComPermissoes = (usuarios || []).map(usuario => ({
       ...usuario,
       permissions: permissoesPorUsuario[usuario.id] || []
     }));
-    
-    console.log(`✅ ${usuariosComPermissoes.length} usuários encontrados`);
+
     res.json(usuariosComPermissoes);
-    
-  } catch (err) {
-    console.error('❌ Erro interno:', err);
-    res.status(500).json({ error: 'Erro interno' });
+  } catch (error) {
+    console.error('Erro ao listar usuários:', error);
+    res.status(500).json({ error: 'Erro interno ao listar usuários' });
   }
 });
 
@@ -1085,13 +1062,12 @@ app.get('/users/:id', async (req, res) => {
   }
 });
 
-// ✅ POST /users — COM LOGS DETALHADOS E PERMISSÕES CORRETAS
-app.post('/users', async (req, res) => {
+// ✅ POST /users — COM LOGS DETALHADOS (localhost)
+app.post('/users', checkPermission, async (req, res) => {
   console.log('\n=== 🚀 INICIANDO CRIAÇÃO DE USUÁRIO ===');
   console.log('📥 Corpo da requisição:', req.body);
   
-  // ✅ Extrair permissions do body também
-  const { name, email, password, role = 'user', permissions = [] } = req.body;
+  const { name, email, password, role = 'user' } = req.body;
 
   // Validação básica
   if (!name || !email || !password) {
@@ -1103,7 +1079,7 @@ app.post('/users', async (req, res) => {
   try {
     // Verificar e-mail duplicado
     console.log('🔍 Verificando se e-mail já existe:', email);
-    const { data: existing, error: checkError } = await supabase
+    const {  existing, error: checkError } = await supabase
       .from('usuarios')
       .select('id')
       .eq('email', email)
@@ -1148,33 +1124,8 @@ app.post('/users', async (req, res) => {
     }
 
     console.log('✅ Usuário criado com sucesso:', data[0]);
-
-    // ✅ ✅ ✅ BLOCO DE PERMISSÕES - AGORA DENTRO DA FUNÇÃO ASYNC ✅ ✅ ✅
-    if (Array.isArray(permissions) && permissions.length > 0) {
-      const novasPermissoes = permissions.map(tela => ({
-        usuario_id: data[0].id,  // ID do usuário recém-criado
-        tela,
-        acao: 'visualizar'
-      }));
-      
-      const { error: permError } = await supabase
-        .from('permissoes_usuario')
-        .insert(novasPermissoes);
-        
-      if (permError) {
-        console.warn('⚠️ Erro ao salvar permissões iniciais:', permError);
-      } else {
-        console.log(`✅ ${permissions.length} permissões salvas para novo usuário`);
-      }
-    }
-    // ✅ ✅ ✅ FIM DO BLOCO DE PERMISSÕES ✅ ✅ ✅
-
     console.log('=== 🎉 CRIAÇÃO CONCLUÍDA ===\n');
-    
-    // ✅ Responder com o usuário criado (SEM senha)
-    const { password: _, ...usuarioSemSenha } = data[0];
-    res.status(201).json(usuarioSemSenha);
-    
+    res.status(201).json(data[0]);
   } catch (error) {
     console.error('💥 ERRO INESPERADO:', error);
     res.status(500).json({ error: 'Erro interno ao criar usuário' });
@@ -1639,7 +1590,7 @@ app.get('/pedidos-compra', async (req, res) => {
 });
 
 // POST /pedidos-compra
-app.post('/pedidos-compra', async (req, res) => {
+app.post('/pedidos-compra', checkPermission, async (req, res) => {
   try {
     const {
       obra_id,
@@ -2170,7 +2121,7 @@ app.delete('/pedidos-compra/:id', async (req, res) => {
 app.put('/users/:id', async (req, res) => {
   const { id } = req.params;
   const userId = parseInt(id, 10);
-  
+
   if (isNaN(userId)) {
     return res.status(400).json({ error: 'ID de usuário inválido' });
   }
@@ -2182,13 +2133,14 @@ app.put('/users/:id', async (req, res) => {
       return res.status(400).json({ error: 'Nome e e-mail são obrigatórios' });
     }
 
-    // ✅ 1. Atualizar dados do usuário (SEM permissions no corpo principal)
+    // ✅ 1. Atualizar dados do usuário (SEM permissions)
     const updateData = { name, email, role };
     
-    // ✅ Só atualiza senha se for texto claro (não hash)
+    // ✅ Só atualiza senha se for texto claro
     if (password && password.length < 60) {
       updateData.password = await bcrypt.hash(password, 10);
     }
+    // Se password tiver 60+ chars, é um hash → ignora
 
     const { data, error } = await supabase
       .from('usuarios')
@@ -2205,7 +2157,7 @@ app.put('/users/:id', async (req, res) => {
       return res.status(404).json({ error: 'Usuário não encontrado' });
     }
 
-    // ✅ 2. Atualizar permissões (se fornecidas) - DENTRO da função async
+    // ✅ 2. Atualizar permissões (se fornecidas)
     if (Array.isArray(permissions)) {
       // Deletar permissões antigas
       await supabase
@@ -2220,11 +2172,9 @@ app.put('/users/:id', async (req, res) => {
           tela,
           acao: 'visualizar'
         }));
-        
         const { error: permError } = await supabase
           .from('permissoes_usuario')
           .insert(novasPermissoes);
-          
         if (permError) {
           console.error('Erro ao inserir permissões:', permError);
           throw permError;
@@ -2234,13 +2184,11 @@ app.put('/users/:id', async (req, res) => {
 
     // ✅ Responder com o usuário SEM senha
     res.json(data[0]);
-    
   } catch (error) {
     console.error('Erro ao atualizar usuário:', error);
     res.status(500).json({ error: 'Erro interno ao atualizar usuário' });
   }
 });
-// ← FIM DA ROTA - NÃO ADICIONE NADA DEPOIS DESTE PONTO
 
 // DELETE /users/:id
 app.delete('/users/:id', async (req, res) => {
@@ -2375,67 +2323,39 @@ app.post('/users/forgot-password', async (req, res) => {
 });
 
 // ========================
-// ROTA DE LOGIN — COMPATÍVEL COM SENHAS ANTIGAS E NOVAS
+// ROTA DE LOGIN — CORRIGIDA PARA SENHAS CRIPTOGRAFADAS
 // ========================
+
 app.post('/login', async (req, res) => {
   try {
     const { email, password } = req.body;
+
     if (!email || !password) {
       return res.status(400).json({ error: 'E-mail e senha são obrigatórios' });
     }
 
-    // 1. Buscar usuário
     const { data, error } = await supabase
       .from('usuarios')
       .select('*')
       .eq('email', email)
       .single();
-    
+
     if (error || !data) {
       return res.status(401).json({ error: 'Credenciais inválidas' });
     }
 
-    // 2. Verificar senha (compatível com texto plano E hash)
-    let senhaValida = false;
-    
-    // Tenta comparar como hash bcrypt primeiro
-    if (data.password && data.password.length >= 60) {
-      senhaValida = await bcrypt.compare(password, data.password).catch(() => false);
-    }
-    
-    // Se falhar, tenta comparação direta (senha antiga em texto plano)
-    if (!senhaValida && data.password === password) {
-      senhaValida = true;
-      // ✅ Opcional: Atualizar a senha para hash bcrypt automaticamente
-      const hashedPassword = await bcrypt.hash(password, 10);
-      await supabase
-        .from('usuarios')
-        .update({ password: hashedPassword })
-        .eq('id', data.id);
-      console.log(`🔐 Senha do usuário ${data.id} migrada para bcrypt`);
-    }
-    
+    const senhaValida = await bcrypt.compare(password, data.password);
+
     if (!senhaValida) {
       return res.status(401).json({ error: 'Credenciais inválidas' });
     }
 
-    // 3. Buscar permissões e obras autorizadas
-    const [permRes, obraRes] = await Promise.all([
-      supabase.from('permissoes_usuario').select('tela').eq('usuario_id', data.id),
-      supabase.from('acesso_obras_usuario').select('obra_id').eq('usuario_id', data.id)
-    ]);
-
-    // 4. Montar resposta
     const { password: _, ...usuarioSemSenha } = data;
+
     res.json({
       message: 'Login realizado com sucesso',
-      user: {
-        ...usuarioSemSenha,
-        permissions: permRes.data ? permRes.data.map(p => p.tela) : [],
-        authorizedObras: obraRes.data ? obraRes.data.map(o => o.obra_id.toString()) : []
-      }
+      user: usuarioSemSenha
     });
-
   } catch (error) {
     console.error('Erro no login:', error.message);
     res.status(500).json({ error: 'Erro interno no servidor' });
@@ -3910,7 +3830,7 @@ const sanitizeFileName = (name) => {
 };
 
 // POST /notas-fiscais — com upload de anexos
-app.post('/notas-fiscais', upload.fields([
+app.post('/notas-fiscais', checkPermission, upload.fields([
   { name: 'anexo_nota_fiscal', maxCount: 1 },
   { name: 'anexo_boleto', maxCount: 1 }
 ]), async (req, res) => {
@@ -3952,11 +3872,8 @@ app.post('/notas-fiscais', upload.fields([
       return res.status(400).json({ error: 'Todos os itens devem estar vinculados a um serviço do orçamento' });
     }
 
-        // ✅ CÁLCULO COM PARSE CORRETO PARA FORMATO BR:
-    const valorItens = itensArray.reduce((sum, item) => {
-      return sum + parseValorBR(item.preco_total);
-    }, 0);
-    const valorTotal = valorItens + parseValorBR(frete);
+    const valorItens = itensArray.reduce((sum, item) => sum + (item.preco_total || 0), 0);
+    const valorTotal = valorItens + (parseFloat(frete) || 0);
 
     // ✅ Upload de anexos
     let caminhoNF = null;
@@ -4817,10 +4734,10 @@ app.get('/relatorios/financeiro-consolidado', async (req, res) => {
   }
 });
 
-// Função reutilizável: calcular realizado por item (CORRIGIDA COM parseValorBR)
+// Função reutilizável: calcular realizado por item (inclui ADM)
 async function calcularRealizadoPorItem(obraIdNum) {
   try {
-    // 1. Buscar orçamento ativo da obra
+    // 1. Buscar orçamento ativo da obra para obter % de ADM
     const { data: orcamento } = await supabase
       .from('orcamentos')
       .select('id, taxa_administracao')
@@ -4828,18 +4745,16 @@ async function calcularRealizadoPorItem(obraIdNum) {
       .order('created_at', { ascending: false })
       .limit(1)
       .single();
-    
-    // ✅ USAR parseValorBR AQUI
-    const taxaADM = orcamento ? parseValorBR(orcamento.taxa_administracao) : 0;
+
+    const taxaADM = orcamento ? parseFloat(orcamento.taxa_administracao) || 0 : 0;
     const temADM = taxaADM > 0;
 
-    // 2. Buscar notas PAGAS da obra
+    // 2. Buscar todas as notas PAGAS da obra (com valor_total, valor_pago e frete)
     const { data: notas, error: notasError } = await supabase
       .from('notas_fiscais')
       .select('id, valor_total, valor_pago, frete')
       .eq('obra_id', obraIdNum)
       .eq('status', 'pago');
-    
     if (notasError) throw notasError;
     if (!notas || notas.length === 0) {
       return temADM ? [{ orcamento_item_id: 'ADM', valor_realizado: '0.00' }] : [];
@@ -4849,58 +4764,52 @@ async function calcularRealizadoPorItem(obraIdNum) {
     let valorADMRealizado = 0;
     let realizadoPorItem = new Map();
 
-    // 3. Obter valor orçado total (só serviços)
+    // 3. Obter valor orçado total do orçamento (só serviços)
     if (orcamento) {
       const { data: itensOrc } = await supabase
         .from('itens_orcamento')
         .select('quantidade, valor_unitario_material, valor_unitario_mao_obra')
         .eq('orcamento_id', orcamento.id)
         .eq('nivel', 'servico');
-      
-      // ✅ USAR parseValorBR EM TODOS OS CAMPOS
-      valorTotalOrcado = (itensOrc || []).reduce((sum, item) => {
-        const qtd = parseValorBR(item.quantidade);
-        const mat = parseValorBR(item.valor_unitario_material);
-        const mao = parseValorBR(item.valor_unitario_mao_obra);
+      valorTotalOrcado = itensOrc.reduce((sum, item) => {
+        const qtd = parseFloat(item.quantidade) || 0;
+        const mat = parseFloat(item.valor_unitario_material) || 0;
+        const mao = parseFloat(item.valor_unitario_mao_obra) || 0;
         return sum + qtd * (mat + mao);
       }, 0);
     }
 
     // 4. Processar cada nota
     for (const nota of notas) {
-      // ✅ USAR parseValorBR AQUI
-      const valorTotalNota = parseValorBR(nota.valor_total);
-      const valorPago = parseValorBR(nota.valor_pago);
-      const frete = parseValorBR(nota.frete);
-      
+      const notaId = nota.id;
+      const valorTotalNota = parseFloat(nota.valor_total) || 0;
+      const valorPago = parseFloat(nota.valor_pago) || 0;
+      const frete = parseFloat(nota.frete) || 0;
       if (valorTotalNota <= 0 || valorPago <= 0) continue;
-      
+
+      // Calcula valor orçado da nota (exclui frete)
       const valorNotaSemFrete = valorTotalNota - frete;
 
-      // Calcular ADM proporcional
-      if (temADM && valorTotalOrcado > 0 && valorNotaSemFrete > 0) {
-        const proporcao = valorNotaSemFrete / valorTotalOrcado;
-        const valorADM = (taxaADM / 100) * valorTotalOrcado * Math.min(proporcao, 1);
-        valorADMRealizado += valorADM;
+      // Calcula valor de ADM pago nesta nota (se houver taxa)
+      if (temADM && valorTotalOrcado > 0) {
+        const proporcaoADMNaNota = valorNotaSemFrete / valorTotalOrcado;
+        const valorADMNota = (taxaADM / 100) * valorTotalOrcado * proporcaoADMNaNota;
+        valorADMRealizado += valorADMNota;
       }
 
-      // Buscar itens da nota
+      // Distribuir valor pago aos itens da nota
       const { data: itens, error: itensError } = await supabase
         .from('itens_nota_fiscal')
         .select('orcamento_item_id, preco_total')
-        .eq('nota_fiscal_id', nota.id)
+        .eq('nota_fiscal_id', notaId)
         .not('orcamento_item_id', 'is', null);
-      
       if (itensError || !itens) continue;
 
       for (const item of itens) {
-        // ✅ USAR parseValorBR AQUI
-        const precoItem = parseValorBR(item.preco_total);
+        const precoItem = parseFloat(item.preco_total) || 0;
         if (precoItem <= 0) continue;
-
         const proporcao = precoItem / valorTotalNota;
         const valorRealizado = valorPago * proporcao;
-        
         const idItem = item.orcamento_item_id;
         const totalAtual = realizadoPorItem.get(idItem) || 0;
         realizadoPorItem.set(idItem, totalAtual + valorRealizado);
@@ -4913,8 +4822,8 @@ async function calcularRealizadoPorItem(obraIdNum) {
       valor_realizado: parseFloat(valor).toFixed(2)
     }));
 
-    // 6. Adicionar ADM se aplicável
-    if (temADM && valorADMRealizado > 0) {
+    // 6. Adicionar linha de ADM se aplicável
+    if (temADM) {
       resultado.push({
         orcamento_item_id: 'ADM',
         valor_realizado: valorADMRealizado.toFixed(2)
@@ -4932,62 +4841,18 @@ async function calcularRealizadoPorItem(obraIdNum) {
 app.get('/relatorios/obra/:obraId/realizado-por-item', async (req, res) => {
   const { obraId } = req.params;
   const obraIdNum = parseInt(obraId, 10);
-  if (isNaN(obraIdNum)) return res.status(400).json({ error: 'ID da obra inválido' });
-  
+  if (isNaN(obraIdNum)) {
+    return res.status(400).json({ error: 'ID da obra inválido' });
+  }
   try {
-    // 1. Buscar orçamento mais recente
-    const { data: orcamento } = await supabase
-      .from('orcamentos')
-      .select('id')
-      .eq('obra_id', obraIdNum)
-      .order('created_at', { ascending: false })
-      .limit(1)
-      .single();
-    
-    console.log(`🔍 [ROTA] Obra ${obraIdNum}, orçamento encontrado: ${orcamento?.id || 'NENHUM'}`);
-    
-    if (!orcamento) {
-      return res.json([]);
-    }
-
-    // 2. Calcular realizado
-    const resultadoRaw = await calcularRealizadoPorItem(obraIdNum, orcamento.id);
-    
-    // 3. Mapear ID → código
-    const { data: itensOrc, error: itensError } = await supabase
-      .from('itens_orcamento')
-      .select('id, codigo')
-      .eq('orcamento_id', orcamento.id);
-    
-    if (itensError) throw itensError;
-    
-    const idParaCodigo = new Map();
-    if (itensOrc) {
-      // ✅ Padronizar chaves como STRING para o frontend
-      itensOrc.forEach(i => idParaCodigo.set(String(i.id), i.codigo));
-    }
-    
-    // 4. Converter resultado
-    const resultado = resultadoRaw.map(r => {
-      if (r.orcamento_item_id === 'ADM') {
-        return { orcamento_item_id: 'ADM', codigo: 'ADM', valor_realizado: r.valor_realizado };
-      }
-      const idKey = String(r.orcamento_item_id);
-      return {
-        orcamento_item_id: r.orcamento_item_id,
-        codigo: idParaCodigo.get(idKey) || idKey,
-        valor_realizado: r.valor_realizado
-      };
-    });
-    
-    console.log(`✅ [ROTA] Enviando ${resultado.length} itens (orçamento ${orcamento.id})`);
+    const resultado = await calcularRealizadoPorItem(obraIdNum);
     res.json(resultado);
-    
   } catch (error) {
-    console.error('❌ Erro na rota realizado-por-item:', error);
+    console.error('Erro ao carregar realizado por item:', error);
     res.status(500).json({ error: 'Erro ao carregar realizado por item' });
   }
-});
+}); 
+
 console.log('🚀 SERVIDOR PERSONALIZADO DO ERP MINHAS OBRAS INICIADO!');
 
 // === FIM DO DEBUG ===
